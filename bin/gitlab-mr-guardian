@@ -1,0 +1,1023 @@
+#!/usr/bin/env python3
+"""Safely monitor and advance approved GitLab merge requests.
+
+Authentication and host selection are delegated to the GitLab CLI (`glab`).
+No token is read or stored by this program.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlencode
+
+
+PROGRAM = "gitlab-mr-guardian"
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "hostname": None,
+    "poll_interval_seconds": 3600,
+    "auto_rebase": False,
+    "auto_merge": False,
+    "trigger_pipeline_when_missing_or_skipped": True,
+    "require_at_least_one_approval": True,
+    "allow_rebase_that_resets_approvals": False,
+    "allow_rebase_when_approval_policy_unknown": False,
+    "include_projects": [],
+    "exclude_projects": [],
+    "max_mr_age_days": 90,
+    "max_open_merge_requests": 50,
+    "rebase_cooldown_seconds": 900,
+    "report_ci_failures": True,
+}
+
+PLUGIN_OPTION_FIELDS = (
+    "hostname",
+    "poll_interval_seconds",
+    "auto_rebase",
+    "auto_merge",
+    "trigger_pipeline_when_missing_or_skipped",
+    "include_projects",
+    "max_mr_age_days",
+    "report_ci_failures",
+)
+
+RUNNING_PIPELINE_STATES = {
+    "created",
+    "waiting_for_resource",
+    "preparing",
+    "pending",
+    "running",
+    "scheduled",
+}
+FAILED_PIPELINE_STATES = {"failed", "canceled"}
+REVIEW_BLOCKING_STATUSES = {
+    "not_approved",
+    "requested_changes",
+    "discussions_not_resolved",
+}
+HARD_BLOCKING_STATUSES = {
+    "conflict",
+    "locked_paths",
+    "locked_lfs_files",
+}
+
+
+class GuardianError(RuntimeError):
+    pass
+
+
+class ApiError(GuardianError):
+    def __init__(self, endpoint: str, message: str, returncode: int = 1):
+        super().__init__(f"GitLab API 调用失败（{endpoint}）：{message}")
+        self.endpoint = endpoint
+        self.returncode = returncode
+
+
+def json_line(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def emit(payload: Dict[str, Any]) -> None:
+    print(json_line({"source": PROGRAM, **payload}), flush=True)
+
+
+def discover_hostname() -> Optional[str]:
+    configured = os.environ.get("GL_HOST")
+    if configured:
+        return configured
+
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    remote = result.stdout.strip()
+    if result.returncode != 0 or not remote:
+        return None
+
+    if "://" in remote:
+        from urllib.parse import urlparse
+
+        return urlparse(remote).hostname
+    if "@" in remote and ":" in remote:
+        return remote.split("@", 1)[1].split(":", 1)[0]
+    return None
+
+
+def default_user_config_path() -> Path:
+    configured_root = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(configured_root).expanduser() if configured_root else Path.home() / ".config"
+    return root / PROGRAM / "config.json"
+
+
+def find_config_path(explicit: Optional[str] = None) -> Optional[Path]:
+    candidate = explicit or os.environ.get("MR_GUARDIAN_CONFIG")
+    if candidate:
+        return Path(candidate).expanduser().resolve()
+    path = default_user_config_path()
+    if path.is_file():
+        return path
+    return None
+
+
+def plugin_option(name: str) -> Optional[str]:
+    prefix = "CLAUDE_PLUGIN_OPTION_"
+    for key in (f"{prefix}{name}", f"{prefix}{name.upper()}"):
+        if key in os.environ:
+            return os.environ[key]
+    return None
+
+
+def parse_bool_option(name: str, value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise GuardianError(f"插件配置项 {name} 必须是布尔值")
+
+
+def parse_int_option(name: str, value: str) -> int:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise GuardianError(f"插件配置项 {name} 必须是整数") from exc
+    if not number.is_integer():
+        raise GuardianError(f"插件配置项 {name} 必须是整数")
+    return int(number)
+
+
+def plugin_options_config() -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    for name in PLUGIN_OPTION_FIELDS:
+        value = plugin_option(name)
+        if value is None:
+            continue
+        if name in {
+            "auto_rebase",
+            "auto_merge",
+            "trigger_pipeline_when_missing_or_skipped",
+            "report_ci_failures",
+        }:
+            config[name] = parse_bool_option(name, value)
+        elif name in {"poll_interval_seconds", "max_mr_age_days"}:
+            config[name] = parse_int_option(name, value)
+        elif name == "include_projects":
+            config[name] = [item.strip() for item in value.split(",") if item.strip()]
+        elif name == "hostname":
+            config[name] = value.strip() or None
+    return config
+
+
+def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    result = {**DEFAULT_CONFIG, **config}
+    bool_fields = (
+        "enabled",
+        "auto_rebase",
+        "auto_merge",
+        "trigger_pipeline_when_missing_or_skipped",
+        "require_at_least_one_approval",
+        "allow_rebase_that_resets_approvals",
+        "allow_rebase_when_approval_policy_unknown",
+        "report_ci_failures",
+    )
+    for field in bool_fields:
+        if not isinstance(result[field], bool):
+            raise GuardianError(f"配置项 {field} 必须是布尔值")
+
+    for field, minimum in (
+        ("poll_interval_seconds", 60),
+        ("max_open_merge_requests", 1),
+        ("rebase_cooldown_seconds", 60),
+    ):
+        if not isinstance(result[field], int) or result[field] < minimum:
+            raise GuardianError(f"配置项 {field} 必须是不小于 {minimum} 的整数")
+
+    if not isinstance(result["max_mr_age_days"], int) or result["max_mr_age_days"] < 0:
+        raise GuardianError("配置项 max_mr_age_days 必须是不小于 0 的整数")
+
+    for field in ("include_projects", "exclude_projects"):
+        if not isinstance(result[field], list) or not all(
+            isinstance(value, (str, int)) for value in result[field]
+        ):
+            raise GuardianError(f"配置项 {field} 必须是字符串或数字数组")
+
+    hostname = result.get("hostname")
+    if hostname is not None and not isinstance(hostname, str):
+        raise GuardianError("配置项 hostname 必须是字符串或 null")
+    return result
+
+
+def load_config(
+    explicit: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Optional[Path], str]:
+    plugin_config = plugin_options_config()
+    explicit_candidate = explicit or os.environ.get("MR_GUARDIAN_CONFIG")
+    if plugin_config and not explicit_candidate:
+        return validate_config(plugin_config), None, "plugin-user-config"
+
+    path = find_config_path(explicit)
+    if path is None:
+        return validate_config({}), None, "built-in-defaults"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GuardianError(f"无法读取配置 {path}：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise GuardianError(f"配置 {path} 的顶层必须是 JSON 对象")
+    return validate_config(payload), path, "user-config-file"
+
+
+def state_path(config: Dict[str, Any]) -> Path:
+    explicit = os.environ.get("MR_GUARDIAN_STATE_FILE") or config.get("state_file")
+    if explicit:
+        return Path(str(explicit)).expanduser().resolve()
+    host = config.get("hostname") or discover_hostname() or "default"
+    digest = hashlib.sha256(host.encode("utf-8")).hexdigest()[:12]
+    plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if plugin_data:
+        return Path(plugin_data).expanduser() / f"state-{digest}.json"
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache_root / PROGRAM / f"state-{digest}.json"
+
+
+class StateStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self.data: Dict[str, Any] = {"version": 1, "mrs": {}, "events": {}, "actions": {}}
+
+    def load(self) -> None:
+        if not self.path.is_file():
+            return
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(loaded, dict) and loaded.get("version") == 1:
+            self.data.update(loaded)
+            for key in ("mrs", "events", "actions"):
+                if not isinstance(self.data.get(key), dict):
+                    self.data[key] = {}
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.path)
+
+    def should_emit(self, key: str, signature: str) -> bool:
+        previous = self.data["events"].get(key)
+        self.data["events"][key] = signature
+        return previous != signature
+
+    def action_allowed(self, key: str, signature: str, cooldown: int) -> bool:
+        previous = self.data["actions"].get(key)
+        now = int(time.time())
+        if isinstance(previous, dict):
+            same = previous.get("signature") == signature
+            recent = now - int(previous.get("at", 0)) < cooldown
+            if same and recent:
+                return False
+        return True
+
+    def record_action(self, key: str, signature: str) -> None:
+        now = int(time.time())
+        self.data["actions"][key] = {"signature": signature, "at": now}
+
+
+class InstanceLock:
+    def __init__(self, path: Path):
+        self.path = path.with_suffix(path.suffix + ".lock")
+        self.handle: Optional[Any] = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.handle.close()
+            self.handle = None
+            return False
+        return True
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        with contextlib.suppress(OSError):
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        self.handle.close()
+        self.handle = None
+
+
+class GlabClient:
+    def __init__(self, hostname: Optional[str], executable: str = "glab"):
+        self.hostname = hostname
+        self.executable = executable
+
+    def api(
+        self,
+        endpoint: str,
+        *,
+        method: str = "GET",
+        query: Optional[Dict[str, Any]] = None,
+        fields: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        if query:
+            endpoint = f"{endpoint}?{urlencode(query, doseq=True)}"
+        command = [self.executable, "api", endpoint]
+        if self.hostname:
+            command.extend(["--hostname", self.hostname])
+        if method != "GET":
+            command.extend(["--method", method])
+        for key, value in (fields or {}).items():
+            serialized = str(value).lower() if isinstance(value, bool) else str(value)
+            command.extend(["--field", f"{key}={serialized}"])
+
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=60,
+            )
+        except FileNotFoundError as exc:
+            raise GuardianError("未找到 glab，请先安装 GitLab CLI 并完成登录") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ApiError(endpoint, "请求超时") from exc
+
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "未知错误").strip()
+            raise ApiError(endpoint, message[:500], result.returncode)
+        output = result.stdout.strip()
+        if not output:
+            return None
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise ApiError(endpoint, "返回内容不是有效 JSON") from exc
+
+    def paginated(self, endpoint: str, query: Optional[Dict[str, Any]] = None) -> List[Any]:
+        items: List[Any] = []
+        page = 1
+        while True:
+            page_query = {**(query or {}), "page": page, "per_page": 100}
+            payload = self.api(endpoint, query=page_query)
+            if not isinstance(payload, list):
+                raise ApiError(endpoint, "分页接口未返回数组")
+            items.extend(payload)
+            if len(payload) < 100:
+                return items
+            page += 1
+            if page > 20:
+                raise ApiError(endpoint, "分页超过安全上限 2000 条")
+
+
+def project_name(mr: Dict[str, Any]) -> str:
+    reference = mr.get("references") or {}
+    full = reference.get("full") if isinstance(reference, dict) else None
+    if isinstance(full, str) and "!" in full:
+        return full.rsplit("!", 1)[0]
+    return str(mr.get("project_id", "unknown"))
+
+
+def mr_key(mr: Dict[str, Any]) -> str:
+    return f"{mr.get('project_id')}!{mr.get('iid')}"
+
+
+def project_is_in_scope(mr: Dict[str, Any], config: Dict[str, Any]) -> bool:
+    candidates = {str(mr.get("project_id")), project_name(mr)}
+    included = {str(value) for value in config["include_projects"]}
+    excluded = {str(value) for value in config["exclude_projects"]}
+    if candidates & excluded:
+        return False
+    return not included or bool(candidates & included)
+
+
+def mr_is_recent(mr: Dict[str, Any], max_age_days: int) -> bool:
+    if max_age_days == 0:
+        return True
+    value = mr.get("updated_at") or mr.get("created_at")
+    if not isinstance(value, str):
+        return False
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
+    return age_seconds <= max_age_days * 24 * 60 * 60
+
+
+def is_draft(mr: Dict[str, Any]) -> bool:
+    return bool(
+        mr.get("draft")
+        or mr.get("work_in_progress")
+        or str(mr.get("title", "")).lower().startswith(("draft:", "wip:"))
+    )
+
+
+def approval_satisfied(payload: Dict[str, Any], require_one: bool) -> bool:
+    if not bool(payload.get("approved")):
+        return False
+    approved_by = payload.get("approved_by")
+    return not require_one or bool(approved_by)
+
+
+def has_unresolved_discussion(client: GlabClient, project_id: Any, iid: Any) -> bool:
+    discussions = client.paginated(
+        f"projects/{project_id}/merge_requests/{iid}/discussions"
+    )
+    for discussion in discussions:
+        for note in discussion.get("notes") or []:
+            if note.get("resolvable") and not note.get("resolved", False):
+                return True
+    return False
+
+
+def list_mr_pipelines(client: GlabClient, mr: Dict[str, Any]) -> List[Dict[str, Any]]:
+    project_id, iid = mr.get("project_id"), mr.get("iid")
+    pipelines = client.api(
+        f"projects/{project_id}/merge_requests/{iid}/pipelines",
+        query={"page": 1, "per_page": 100},
+    )
+    if not isinstance(pipelines, list):
+        raise ApiError("merge request pipelines", "接口未返回数组")
+    return [pipeline for pipeline in pipelines if isinstance(pipeline, dict)]
+
+
+def current_pipeline(client: GlabClient, mr: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    pipeline = mr.get("head_pipeline")
+    if isinstance(pipeline, dict):
+        return pipeline
+    pipelines = list_mr_pipelines(client, mr)
+    if not pipelines:
+        return None
+    return max(pipelines, key=lambda item: int(item.get("id", 0)))
+
+
+def pipeline_view(pipeline: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if pipeline is None:
+        return {"id": None, "status": "missing", "url": None}
+    return {
+        "id": pipeline.get("id"),
+        "status": pipeline.get("status") or "unknown",
+        "url": pipeline.get("web_url"),
+    }
+
+
+def approval_reset_policy(
+    client: GlabClient,
+    project_id: Any,
+    cache: Dict[str, Optional[bool]],
+) -> Optional[bool]:
+    key = str(project_id)
+    if key in cache:
+        return cache[key]
+    try:
+        payload = client.api(f"projects/{project_id}/approvals")
+    except ApiError:
+        cache[key] = None
+        return None
+    value = payload.get("reset_approvals_on_push") if isinstance(payload, dict) else None
+    cache[key] = value if isinstance(value, bool) else None
+    return cache[key]
+
+
+def event_for_mr(
+    kind: str,
+    mr: Dict[str, Any],
+    message: str,
+    **extra: Any,
+) -> Dict[str, Any]:
+    return {
+        "event": kind,
+        "mr": mr_key(mr),
+        "project": project_name(mr),
+        "title": mr.get("title"),
+        "url": mr.get("web_url"),
+        "message": message,
+        **extra,
+    }
+
+
+def run_cycle(
+    client: GlabClient,
+    config: Dict[str, Any],
+    state: StateStore,
+    *,
+    mutate: bool,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    events: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
+    policy_cache: Dict[str, Optional[bool]] = {}
+
+    open_mrs = client.api(
+        "merge_requests",
+        query={
+            "state": "opened",
+            "scope": "created_by_me",
+            "order_by": "updated_at",
+            "sort": "desc",
+            "per_page": min(100, config["max_open_merge_requests"]),
+            "with_merge_status_recheck": "true",
+        },
+    )
+    if not isinstance(open_mrs, list):
+        raise ApiError("merge_requests", "接口未返回数组")
+
+    for listed_mr in open_mrs[: config["max_open_merge_requests"]]:
+        if (
+            is_draft(listed_mr)
+            or not project_is_in_scope(listed_mr, config)
+            or not mr_is_recent(listed_mr, config["max_mr_age_days"])
+        ):
+            continue
+
+        project_id, iid = listed_mr.get("project_id"), listed_mr.get("iid")
+        key = mr_key(listed_mr)
+        previous = state.data["mrs"].get(key, {})
+        managed_before = bool(previous.get("managed"))
+
+        try:
+            mr = client.api(
+                f"projects/{project_id}/merge_requests/{iid}",
+                query={
+                    "include_rebase_in_progress": "true",
+                    "include_diverged_commits_count": "true",
+                },
+            )
+            approvals = client.api(
+                f"projects/{project_id}/merge_requests/{iid}/approvals"
+            )
+            if not isinstance(mr, dict) or not isinstance(approvals, dict):
+                raise GuardianError("MR 或审批接口返回格式错误")
+
+            pipeline = pipeline_view(current_pipeline(client, mr))
+            status = str(mr.get("detailed_merge_status") or "unknown")
+            approved = approval_satisfied(
+                approvals, config["require_at_least_one_approval"]
+            )
+            historical_success = False
+            if approved and not managed_before and pipeline["status"] != "success":
+                history = list_mr_pipelines(client, mr)
+                historical_success = any(
+                    item.get("status") == "success" for item in history
+                )
+
+            # Managed MRs continue to report CI failures even if a rebase reset approval.
+            if (
+                managed_before
+                and config["report_ci_failures"]
+                and pipeline["status"] in FAILED_PIPELINE_STATES
+            ):
+                signature = f"{pipeline['id']}:{pipeline['status']}"
+                event_key = f"ci-failed:{key}"
+                if state.should_emit(event_key, signature):
+                    events.append(
+                        event_for_mr(
+                            "CI_FAILED",
+                            mr,
+                            "受监控 MR 的 CI 失败，需要人工检查；插件不会自动重试。",
+                            pipeline=pipeline,
+                        )
+                    )
+
+            if not approved:
+                phase = "waiting_approval"
+                if managed_before:
+                    signature = str(mr.get("sha"))
+                    if state.should_emit(f"approval-lost:{key}", signature):
+                        events.append(
+                            event_for_mr(
+                                "APPROVAL_LOST",
+                                mr,
+                                "受监控 MR 当前不再满足审批要求，自动操作已暂停。",
+                            )
+                        )
+                row = {
+                    "mr": key,
+                    "project": project_name(mr),
+                    "title": mr.get("title"),
+                    "url": mr.get("web_url"),
+                    "phase": phase,
+                    "managed": managed_before,
+                    "approved": False,
+                    "pipeline": pipeline,
+                    "merge_status": status,
+                }
+                rows.append(row)
+                state.data["mrs"][key] = {**row, "sha": mr.get("sha")}
+                continue
+
+            unresolved = status in REVIEW_BLOCKING_STATUSES or has_unresolved_discussion(
+                client, project_id, iid
+            )
+            if unresolved:
+                row = {
+                    "mr": key,
+                    "project": project_name(mr),
+                    "title": mr.get("title"),
+                    "url": mr.get("web_url"),
+                    "phase": "paused_for_review",
+                    "managed": managed_before,
+                    "approved": True,
+                    "pipeline": pipeline,
+                    "merge_status": status,
+                }
+                rows.append(row)
+                state.data["mrs"][key] = {**row, "sha": mr.get("sha")}
+                continue
+
+            managed_from_history = approved and historical_success
+            if (
+                managed_from_history
+                and config["report_ci_failures"]
+                and pipeline["status"] in FAILED_PIPELINE_STATES
+            ):
+                signature = f"{pipeline['id']}:{pipeline['status']}"
+                event_key = f"ci-failed:{key}"
+                if state.should_emit(event_key, signature):
+                    events.append(
+                        event_for_mr(
+                            "CI_FAILED",
+                            mr,
+                            "此前 CI 成功的已审批 MR 当前 CI 失败，需要人工检查；插件不会自动重试。",
+                            pipeline=pipeline,
+                        )
+                    )
+
+            if pipeline["status"] != "success":
+                managed = managed_before or managed_from_history
+                phase = "waiting_for_successful_ci"
+                if pipeline["status"] in RUNNING_PIPELINE_STATES:
+                    phase = "ci_running"
+                elif pipeline["status"] in {"missing", "skipped"} and managed:
+                    phase = "pipeline_refresh_needed"
+                    if mutate and config["trigger_pipeline_when_missing_or_skipped"]:
+                        action_key = f"pipeline:{key}"
+                        action_signature = f"{mr.get('sha')}:{pipeline['status']}"
+                        if state.action_allowed(
+                            action_key,
+                            action_signature,
+                            config["rebase_cooldown_seconds"],
+                        ):
+                            requested = client.api(
+                                f"projects/{project_id}/merge_requests/{iid}/pipelines",
+                                method="POST",
+                            )
+                            state.record_action(action_key, action_signature)
+                            phase = "pipeline_requested"
+                            requested_pipeline = (
+                                requested if isinstance(requested, dict) else {}
+                            )
+                            events.append(
+                                event_for_mr(
+                                    "PIPELINE_REQUESTED",
+                                    mr,
+                                    "当前 Pipeline 缺失或被跳过；已为受监控 MR 创建新的 MR Pipeline。",
+                                    pipeline={
+                                        "id": requested_pipeline.get("id"),
+                                        "status": requested_pipeline.get("status", "pending"),
+                                        "url": requested_pipeline.get("web_url"),
+                                    },
+                                )
+                            )
+                row = {
+                    "mr": key,
+                    "project": project_name(mr),
+                    "title": mr.get("title"),
+                    "url": mr.get("web_url"),
+                    "phase": phase,
+                    "managed": managed,
+                    "approved": True,
+                    "pipeline": pipeline,
+                    "merge_status": status,
+                }
+                rows.append(row)
+                state.data["mrs"][key] = {**row, "sha": mr.get("sha")}
+                continue
+
+            managed = True
+            phase = "eligible"
+
+            if status in HARD_BLOCKING_STATUSES:
+                phase = "blocked"
+                signature = f"{status}:{mr.get('sha')}"
+                if managed_before and state.should_emit(f"blocked:{key}", signature):
+                    events.append(
+                        event_for_mr(
+                            "MR_BLOCKED",
+                            mr,
+                            f"受监控 MR 被 {status} 阻塞，需要人工处理。",
+                        )
+                    )
+            elif mr.get("rebase_in_progress"):
+                phase = "rebasing"
+            elif status == "need_rebase":
+                phase = "needs_rebase"
+                if mutate and config["auto_rebase"]:
+                    resets = approval_reset_policy(client, project_id, policy_cache)
+                    safe_policy = (
+                        resets is False
+                        or (resets is True and config["allow_rebase_that_resets_approvals"])
+                        or (
+                            resets is None
+                            and config["allow_rebase_when_approval_policy_unknown"]
+                        )
+                    )
+                    if not safe_policy:
+                        policy_name = "unknown" if resets is None else "resets-approvals"
+                        signature = f"{policy_name}:{mr.get('sha')}"
+                        if state.should_emit(f"rebase-policy:{key}", signature):
+                            events.append(
+                                event_for_mr(
+                                    "REBASE_BLOCKED_BY_APPROVAL_POLICY",
+                                    mr,
+                                    "自动 rebase 已阻止，因为可能清除现有审批。",
+                                    approval_policy=policy_name,
+                                )
+                            )
+                    else:
+                        action_key = f"rebase:{key}"
+                        action_signature = str(mr.get("sha"))
+                        if state.action_allowed(
+                            action_key,
+                            action_signature,
+                            config["rebase_cooldown_seconds"],
+                        ):
+                            client.api(
+                                f"projects/{project_id}/merge_requests/{iid}/rebase",
+                                method="PUT",
+                            )
+                            state.record_action(action_key, action_signature)
+                            phase = "rebase_requested"
+                            events.append(
+                                event_for_mr(
+                                    "REBASE_REQUESTED",
+                                    mr,
+                                    "已请求安全 rebase；GitLab 将为新提交触发 CI。",
+                                )
+                            )
+            elif mutate and config["auto_merge"]:
+                already_enabled = bool(
+                    mr.get("auto_merge_enabled")
+                    or mr.get("merge_when_pipeline_succeeds")
+                )
+                action_key = f"auto-merge:{key}"
+                action_signature = str(mr.get("sha"))
+                if not already_enabled and state.action_allowed(
+                    action_key,
+                    action_signature,
+                    24 * 60 * 60,
+                ):
+                    result = client.api(
+                        f"projects/{project_id}/merge_requests/{iid}/merge",
+                        method="PUT",
+                        fields={"auto_merge": True, "sha": mr.get("sha")},
+                    )
+                    state.record_action(action_key, action_signature)
+                    merged = isinstance(result, dict) and result.get("state") == "merged"
+                    phase = "merged" if merged else "auto_merge_requested"
+                    events.append(
+                        event_for_mr(
+                            "MERGED" if merged else "AUTO_MERGE_REQUESTED",
+                            mr,
+                            "MR 已合并。" if merged else "已启用自动合并，GitLab 会执行剩余合并检查。",
+                        )
+                    )
+                elif already_enabled:
+                    phase = "auto_merge_enabled"
+
+            row = {
+                "mr": key,
+                "project": project_name(mr),
+                "title": mr.get("title"),
+                "url": mr.get("web_url"),
+                "phase": phase,
+                "managed": managed,
+                "approved": True,
+                "pipeline": pipeline,
+                "merge_status": status,
+            }
+            rows.append(row)
+            state.data["mrs"][key] = {**row, "sha": mr.get("sha")}
+        except GuardianError as exc:
+            signature = str(exc)
+            if state.should_emit(f"mr-error:{key}", signature):
+                events.append(
+                    event_for_mr(
+                        "MR_CHECK_ERROR",
+                        listed_mr,
+                        str(exc),
+                    )
+                )
+
+    return rows, events
+
+
+def output_cycle(rows: List[Dict[str, Any]], events: List[Dict[str, Any]]) -> None:
+    for event in events:
+        emit(event)
+    emit({"event": "CHECK_COMPLETE", "merge_requests": rows, "count": len(rows)})
+
+
+def command_init(args: argparse.Namespace) -> int:
+    target = Path(args.path).expanduser().resolve() if args.path else default_user_config_path()
+    if target.exists() and not args.force:
+        raise GuardianError(f"配置已存在：{target}；如需覆盖请显式使用 --force")
+    hostname = args.hostname or discover_hostname()
+    config = {
+        **DEFAULT_CONFIG,
+        "hostname": hostname,
+        "auto_rebase": args.auto_rebase,
+        "auto_merge": args.auto_merge,
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(target, 0o600)
+    emit(
+        {
+            "event": "CONFIG_CREATED",
+            "path": str(target),
+            "hostname": hostname,
+            "auto_rebase": args.auto_rebase,
+            "auto_merge": args.auto_merge,
+            "message": "用户配置已创建。后台 Monitor 会在 Claude Code 会话期间轮询。",
+        }
+    )
+    return 0
+
+
+def client_for(config: Dict[str, Any]) -> GlabClient:
+    executable = os.environ.get("GLAB_BIN", "glab")
+    if shutil.which(executable) is None and not Path(executable).is_file():
+        raise GuardianError("未找到 glab，请先安装 GitLab CLI 并完成 glab auth login")
+    hostname = config.get("hostname") or discover_hostname()
+    if not hostname:
+        raise GuardianError(
+            "无法确定 GitLab 主机；请在插件配置中填写 hostname，"
+            "或从带有 GitLab origin remote 的仓库运行"
+        )
+    return GlabClient(hostname, executable)
+
+
+def command_status_or_check(args: argparse.Namespace, mutate: bool) -> int:
+    config, path, source = load_config(args.config)
+    if not config["enabled"]:
+        location = str(path) if path else source
+        raise GuardianError(f"监控已在 {location} 中禁用")
+
+    state = StateStore(state_path(config))
+    state.load()
+    lock = InstanceLock(state.path)
+    if mutate and not lock.acquire():
+        raise GuardianError("另一个 MR Guardian 实例正在运行；为避免重复操作，本次检查已停止")
+    try:
+        rows, events = run_cycle(client_for(config), config, state, mutate=mutate)
+        if mutate:
+            state.save()
+        output_cycle(rows, events)
+    finally:
+        lock.release()
+    return 0
+
+
+def command_monitor(args: argparse.Namespace) -> int:
+    stop = False
+
+    def request_stop(_signum: int, _frame: Any) -> None:
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    warned: Optional[str] = None
+    lock: Optional[InstanceLock] = None
+    state: Optional[StateStore] = None
+
+    while not stop:
+        try:
+            config, path, source = load_config(args.config)
+            interval = config["poll_interval_seconds"]
+            if not config["enabled"]:
+                location = str(path) if path else source
+                warning = f"MR Guardian 已在 {location} 中禁用。"
+                if warned != warning:
+                    emit({"event": "MONITOR_DISABLED", "message": warning})
+                    warned = warning
+            else:
+                desired_state_path = state_path(config)
+                if state is None or state.path != desired_state_path:
+                    if lock is not None:
+                        lock.release()
+                    state = StateStore(desired_state_path)
+                    state.load()
+                    lock = InstanceLock(desired_state_path)
+                    if not lock.acquire():
+                        warning = "另一个 MR Guardian Monitor 已在运行，本会话不会重复启动。"
+                        if warned != warning:
+                            emit({"event": "MONITOR_ALREADY_RUNNING", "message": warning})
+                            warned = warning
+                        state = None
+                        lock = None
+                if state is not None:
+                    warned = None
+                    _rows, events = run_cycle(
+                        client_for(config), config, state, mutate=True
+                    )
+                    for event in events:
+                        emit(event)
+                    state.save()
+        except GuardianError as exc:
+            interval = DEFAULT_CONFIG["poll_interval_seconds"]
+            warning = str(exc)
+            if warned != warning:
+                emit({"event": "MONITOR_ERROR", "message": warning})
+                warned = warning
+
+        deadline = time.monotonic() + interval
+        while not stop and time.monotonic() < deadline:
+            time.sleep(min(1.0, deadline - time.monotonic()))
+
+    if lock is not None:
+        lock.release()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Safely monitor approved GitLab merge requests.",
+    )
+    parser.add_argument(
+        "--config",
+        help="Path to gitlab-mr-guardian.json (or use MR_GUARDIAN_CONFIG).",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = subparsers.add_parser(
+        "init", help="Create a user configuration file for local development."
+    )
+    init_parser.add_argument("--hostname", help="GitLab hostname, such as gitlab.example.com.")
+    init_parser.add_argument(
+        "--path",
+        help="Configuration output path (defaults to the XDG user config directory).",
+    )
+    init_parser.add_argument("--auto-rebase", action="store_true")
+    init_parser.add_argument("--auto-merge", action="store_true")
+    init_parser.add_argument("--force", action="store_true")
+
+    subparsers.add_parser("status", help="Read-only status check.")
+    subparsers.add_parser("check", help="Run one configured action cycle.")
+    subparsers.add_parser("monitor", help="Continuously poll and emit state changes.")
+    return parser
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    try:
+        if args.command == "init":
+            return command_init(args)
+        if args.command == "status":
+            return command_status_or_check(args, mutate=False)
+        if args.command == "check":
+            return command_status_or_check(args, mutate=True)
+        if args.command == "monitor":
+            return command_monitor(args)
+        parser.error(f"unknown command: {args.command}")
+    except GuardianError as exc:
+        emit({"event": "ERROR", "message": str(exc)})
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

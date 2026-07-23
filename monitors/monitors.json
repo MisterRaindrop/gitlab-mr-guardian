@@ -1,0 +1,7 @@
+[
+  {
+    "name": "gitlab-mr-guardian",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/gitlab-mr-guardian monitor",
+    "description": "Approved GitLab merge requests, rebases, auto-merge, and CI failures"
+  }
+]

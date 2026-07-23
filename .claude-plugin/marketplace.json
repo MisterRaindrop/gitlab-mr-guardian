@@ -1,0 +1,21 @@
+{
+  "name": "gitlab-mr-guardian-marketplace",
+  "owner": {
+    "name": "MisterRaindrop"
+  },
+  "description": "Claude Code plugins for safely advancing approved GitLab merge requests.",
+  "plugins": [
+    {
+      "name": "gitlab-mr-guardian",
+      "source": "./",
+      "description": "Monitor approved GitLab merge requests, safely refresh CI, rebase stale branches, and request auto-merge.",
+      "version": "0.3.5",
+      "tags": [
+        "gitlab",
+        "merge-request",
+        "ci",
+        "automation"
+      ]
+    }
+  ]
+}

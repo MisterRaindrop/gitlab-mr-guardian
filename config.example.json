@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "hostname": "gitlab.example.com",
+  "poll_interval_seconds": 3600,
+  "auto_rebase": true,
+  "auto_merge": true,
+  "trigger_pipeline_when_missing_or_skipped": true,
+  "require_at_least_one_approval": true,
+  "allow_rebase_that_resets_approvals": false,
+  "allow_rebase_when_approval_policy_unknown": false,
+  "include_projects": [],
+  "exclude_projects": [],
+  "max_mr_age_days": 90,
+  "max_open_merge_requests": 50,
+  "rebase_cooldown_seconds": 900,
+  "report_ci_failures": true
+}
