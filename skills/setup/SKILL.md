@@ -14,7 +14,6 @@ argument-hint: [GitLab hostname]
    - `auto_merge`: `${user_config.auto_merge}`
    - `poll_interval_seconds`: `${user_config.poll_interval_seconds}`
    - `trigger_pipeline_when_missing_or_skipped`: `${user_config.trigger_pipeline_when_missing_or_skipped}`
-   - `include_projects`: `${user_config.include_projects}`
    - `max_mr_age_days`: `${user_config.max_mr_age_days}`
    - `report_ci_failures`: `${user_config.report_ci_failures}`
 
@@ -24,10 +23,19 @@ argument-hint: [GitLab hostname]
 5. Run:
 
    ```bash
-   "${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" status
+   "${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" \
+     --plugin-data-dir "${CLAUDE_PLUGIN_DATA}" \
+     --runtime-hostname "${user_config.hostname}" \
+     --runtime-poll-interval-seconds "${user_config.poll_interval_seconds}" \
+     --runtime-auto-rebase "${user_config.auto_rebase}" \
+     --runtime-auto-merge "${user_config.auto_merge}" \
+     --runtime-trigger-pipeline-when-missing-or-skipped "${user_config.trigger_pipeline_when_missing_or_skipped}" \
+     --runtime-max-mr-age-days "${user_config.max_mr_age_days}" \
+     --runtime-report-ci-failures "${user_config.report_ci_failures}" \
+     status
    ```
 
    Summarize which merge requests are monitored, paused for review, waiting for CI, or blocked.
-6. Tell the user that the background monitor runs only while an interactive Claude Code session is open.
+6. Tell the user that background polling is stopped by default, starts only after `/gitlab-mr-guardian:start`, and runs only while an interactive Claude Code session is open.
 
 Do not weaken approval or unresolved-discussion checks. Do not enable `allow_rebase_that_resets_approvals` unless the user explicitly accepts that a rebase can invalidate approvals.

@@ -44,7 +44,7 @@ claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
   --config report_ci_failures=true
 ```
 
-上面的参数是适合“审批完成后自动推进到合并”的推荐配置。它会允许插件自动 rebase 和请求 auto-merge，请先确认这符合团队规则。如果希望先只观察和告警，删除 `auto_rebase=true` 和 `auto_merge=true`，这两个选项默认均为关闭。
+上面的参数允许插件执行 rebase 和请求 auto-merge，请先确认这符合团队规则。安装完成后后台监控仍保持停止，不会因为启动 Claude 就访问 GitLab。需要自动轮询时，在 Claude Code 中显式执行 `/gitlab-mr-guardian:start`；使用 `/gitlab-mr-guardian:stop` 可以随时停止。手动 `/check` 不受监控开关影响。
 
 未通过 `--config` 提供的选项使用插件声明的安全默认值。安装后可以通过 `/plugin` 的 Installed 页面进入配置流程；在已经打开的会话中安装或修改配置后，运行 `/reload-plugins` 即可重新加载。
 
@@ -61,9 +61,10 @@ claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
 | `auto_rebase` | `true` | GitLab 返回 `need_rebase` 且审批安全检查通过时自动请求 rebase。 |
 | `auto_merge` | `true` | 审批和 CI 均满足条件时请求 auto-merge。 |
 | `trigger_pipeline_when_missing_or_skipped` | `true` | 已纳入监控的 MR 没有 Pipeline 或 Pipeline 被跳过时补跑。 |
-| `include_projects` | 留空 | 留空表示当前用户创建的所有项目；也可填 `group/project-a,group/project-b` 限定范围。 |
 | `max_mr_age_days` | `90` | 只处理最近 90 天更新过的 MR，避免误碰长期遗留分支。 |
 | `report_ci_failures` | `true` | CI 失败时通知当前 Claude 会话，但不自动重试失败 CI。 |
+
+不需要配置 `include_projects`。插件默认监控当前 `glab` 用户创建的所有项目中的 MR；高级调试场景仍可在显式 JSON 配置文件中使用该过滤器。
 
 即使启用了推荐配置，以下保护仍然有效：未完成审批、存在未解决 discussion、存在代码冲突、rebase 会清除审批时，插件不会自动推进。失败或取消的 CI 也只报告，不会自动重试。
 
@@ -71,6 +72,7 @@ claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
 
 - **Marketplace 正式安装：**无需创建 JSON。安装命令中的 `--config`，或 `/plugin` 启用时的配置界面，会由 Claude Code 自动保存到用户级插件设置。
 - **`/gitlab-mr-guardian:setup`：**检查 `glab` 认证、展示当前配置并执行只读状态检查；它不会创建或修改业务仓库中的文件。
+- **监控开关：**`start` / `stop` 状态保存在 `${CLAUDE_PLUGIN_DATA}`，默认停止并跨 Claude 会话保留，不需要修改插件安装配置。
 - **重新配置：**打开 `/plugin` → Installed → GitLab MR Guardian 的配置流程，修改后执行 `/reload-plugins`。Monitor 配置变化需要重新启动会话才能完全生效。
 - **`--plugin-dir` 开发模式：**通常直接使用插件默认选项和 Git remote 推断主机。只有脱离 Claude Code 单独测试脚本时，才需要后文所述的用户级开发配置文件。
 
@@ -124,13 +126,17 @@ claude --plugin-dir ./gitlab-mr-guardian
 /gitlab-mr-guardian:setup
 /gitlab-mr-guardian:status
 /gitlab-mr-guardian:check
+/gitlab-mr-guardian:start
+/gitlab-mr-guardian:stop
 ```
 
 - `setup`：检查认证、说明当前配置并执行只读状态检查，不创建配置文件。
 - `status`：只读查看 MR 当前状态。
 - `check`：立即执行一次已配置的受保护推进流程。
+- `start`：开始后台轮询；开关状态跨会话保存。
+- `stop`：停止新的后台轮询，但保留所有手动命令。
 
-插件启用后，后台 Monitor 会自动运行。默认每 1 小时轮询一次，但只在状态发生变化时通知 Claude。安装或重新配置插件时，可以通过 `poll_interval_seconds` 自定义轮询间隔；允许范围为 60～86400 秒。
+后台监控默认停止。执行 `start` 后，当前活跃 Claude 会话会在几秒内开始轮询，默认每 1 小时检查一次，并且只在状态发生变化时通知 Claude。执行 `stop` 后不会开始新的自动周期；已经发出的单次 GitLab 请求可能会先完成。可以通过 `poll_interval_seconds` 自定义 60～86400 秒的间隔。
 
 ## 安全边界
 
@@ -144,7 +150,7 @@ claude --plugin-dir ./gitlab-mr-guardian
 
 ## 运行范围
 
-Claude Code 的插件 Monitor 只属于启动它的当前交互式会话：轮询结果和 CI 告警只会进入这个会话，不会扩散、同步或广播到其他 Claude Code 会话。
+执行 `start` 后，Claude Code 的插件 Monitor 只属于取得运行锁的当前交互式会话：轮询结果和 CI 告警只会进入这个会话，不会扩散、同步或广播到其他 Claude Code 会话。
 
 如果同时打开多个启用了本插件的 Claude Code 会话，插件会通过进程锁避免对同一 GitLab 主机重复执行操作。获得锁的会话负责监控并接收通知；其他会话不会收到这些通知。负责监控的会话关闭后，仍处于运行状态的其他会话可以在下一次轮询时接管。
 

@@ -247,17 +247,96 @@ def load_config(
     return validate_config(payload), path, "user-config-file"
 
 
+def load_runtime_config(
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], Optional[Path], str]:
+    config, path, source = load_config(args.config)
+    overrides: Dict[str, Any] = {}
+
+    hostname = getattr(args, "runtime_hostname", None)
+    if hostname is not None:
+        overrides["hostname"] = hostname.strip() or None
+
+    for argument, field in (
+        ("runtime_poll_interval_seconds", "poll_interval_seconds"),
+        ("runtime_max_mr_age_days", "max_mr_age_days"),
+    ):
+        value = getattr(args, argument, None)
+        if value is not None:
+            overrides[field] = value
+
+    for argument, field in (
+        ("runtime_auto_rebase", "auto_rebase"),
+        ("runtime_auto_merge", "auto_merge"),
+        (
+            "runtime_trigger_pipeline_when_missing_or_skipped",
+            "trigger_pipeline_when_missing_or_skipped",
+        ),
+        ("runtime_report_ci_failures", "report_ci_failures"),
+    ):
+        value = getattr(args, argument, None)
+        if value is not None:
+            overrides[field] = parse_bool_option(field, value)
+
+    plugin_data_dir = getattr(args, "plugin_data_dir", None)
+    if plugin_data_dir:
+        overrides["plugin_data_dir"] = plugin_data_dir
+
+    return validate_config({**config, **overrides}), path, source
+
+
+def plugin_data_root(config: Dict[str, Any]) -> Path:
+    explicit = config.get("plugin_data_dir") or os.environ.get("CLAUDE_PLUGIN_DATA")
+    if explicit:
+        return Path(str(explicit)).expanduser().resolve()
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache_root / PROGRAM
+
+
+def control_path(config: Dict[str, Any]) -> Path:
+    return plugin_data_root(config) / "control.json"
+
+
+def monitor_control_enabled(config: Dict[str, Any]) -> bool:
+    path = control_path(config)
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("enabled") is True
+
+
+def set_monitor_control(config: Dict[str, Any], enabled: bool) -> Path:
+    path = control_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "enabled": enabled,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+    return path
+
+
 def state_path(config: Dict[str, Any]) -> Path:
     explicit = os.environ.get("MR_GUARDIAN_STATE_FILE") or config.get("state_file")
     if explicit:
         return Path(str(explicit)).expanduser().resolve()
     host = config.get("hostname") or discover_hostname() or "default"
     digest = hashlib.sha256(host.encode("utf-8")).hexdigest()[:12]
-    plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
-    if plugin_data:
-        return Path(plugin_data).expanduser() / f"state-{digest}.json"
-    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    return cache_root / PROGRAM / f"state-{digest}.json"
+    return plugin_data_root(config) / f"state-{digest}.json"
 
 
 class StateStore:
@@ -888,7 +967,7 @@ def client_for(config: Dict[str, Any]) -> GlabClient:
 
 
 def command_status_or_check(args: argparse.Namespace, mutate: bool) -> int:
-    config, path, source = load_config(args.config)
+    config, path, source = load_runtime_config(args)
     if not config["enabled"]:
         location = str(path) if path else source
         raise GuardianError(f"监控已在 {location} 中禁用")
@@ -908,6 +987,23 @@ def command_status_or_check(args: argparse.Namespace, mutate: bool) -> int:
     return 0
 
 
+def command_start_or_stop(args: argparse.Namespace, enabled: bool) -> int:
+    config, _path, _source = load_runtime_config(args)
+    set_monitor_control(config, enabled)
+    emit(
+        {
+            "event": "MONITOR_STARTED" if enabled else "MONITOR_STOPPED",
+            "enabled": enabled,
+            "message": (
+                "后台监控已开启，将在当前 Claude 会话中开始轮询。"
+                if enabled
+                else "后台监控已关闭；当前正在执行的单次 GitLab 请求可能会先完成。"
+            ),
+        }
+    )
+    return 0
+
+
 def command_monitor(args: argparse.Namespace) -> int:
     stop = False
 
@@ -923,10 +1019,19 @@ def command_monitor(args: argparse.Namespace) -> int:
     state: Optional[StateStore] = None
 
     while not stop:
+        config_for_wait: Optional[Dict[str, Any]] = None
         try:
-            config, path, source = load_config(args.config)
+            config, path, source = load_runtime_config(args)
+            config_for_wait = config
             interval = config["poll_interval_seconds"]
-            if not config["enabled"]:
+            if not monitor_control_enabled(config):
+                if lock is not None:
+                    lock.release()
+                lock = None
+                state = None
+                warned = None
+                interval = 1
+            elif not config["enabled"]:
                 location = str(path) if path else source
                 warning = f"MR Guardian 已在 {location} 中禁用。"
                 if warned != warning:
@@ -964,6 +1069,12 @@ def command_monitor(args: argparse.Namespace) -> int:
 
         deadline = time.monotonic() + interval
         while not stop and time.monotonic() < deadline:
+            if (
+                interval > 1
+                and config_for_wait is not None
+                and not monitor_control_enabled(config_for_wait)
+            ):
+                break
             time.sleep(min(1.0, deadline - time.monotonic()))
 
     if lock is not None:
@@ -979,6 +1090,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         help="Path to gitlab-mr-guardian.json (or use MR_GUARDIAN_CONFIG).",
+    )
+    parser.add_argument(
+        "--plugin-data-dir",
+        help="Persistent plugin data directory supplied by Claude Code.",
+    )
+    parser.add_argument("--runtime-hostname", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--runtime-poll-interval-seconds",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runtime-auto-rebase",
+        choices=("true", "false"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runtime-auto-merge",
+        choices=("true", "false"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runtime-trigger-pipeline-when-missing-or-skipped",
+        choices=("true", "false"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runtime-max-mr-age-days",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runtime-report-ci-failures",
+        choices=("true", "false"),
+        help=argparse.SUPPRESS,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -996,6 +1142,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("status", help="Read-only status check.")
     subparsers.add_parser("check", help="Run one configured action cycle.")
+    subparsers.add_parser("start", help="Enable background monitoring.")
+    subparsers.add_parser("stop", help="Disable background monitoring.")
     subparsers.add_parser("monitor", help="Continuously poll and emit state changes.")
     return parser
 
@@ -1010,6 +1158,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             return command_status_or_check(args, mutate=False)
         if args.command == "check":
             return command_status_or_check(args, mutate=True)
+        if args.command == "start":
+            return command_start_or_stop(args, enabled=True)
+        if args.command == "stop":
+            return command_start_or_stop(args, enabled=False)
         if args.command == "monitor":
             return command_monitor(args)
         parser.error(f"unknown command: {args.command}")

@@ -44,7 +44,7 @@ claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
   --config report_ci_failures=true
 ```
 
-These are the recommended settings for automatically advancing an MR after review is complete. They allow the plugin to rebase and request auto-merge, so confirm that both actions comply with your team's rules. To begin in monitoring-only mode, remove `auto_rebase=true` and `auto_merge=true`; both options are disabled by default.
+These settings allow the plugin to rebase and request auto-merge, so confirm that both actions comply with your team's rules. Background monitoring remains stopped after installation and starting Claude does not contact GitLab. Run `/gitlab-mr-guardian:start` explicitly in Claude Code to begin automatic polling, and `/gitlab-mr-guardian:stop` to stop it. Manual `/check` remains available regardless of the monitoring state.
 
 Options omitted from `--config` use the safe defaults declared by the plugin. After installation, open the Installed page under `/plugin` to configure the plugin. Run `/reload-plugins` after installing or changing configuration in an existing session.
 
@@ -61,9 +61,10 @@ The following settings best match the plugin's primary goal: keep reviewed MRs m
 | `auto_rebase` | `true` | Request a rebase when GitLab reports `need_rebase` and all approval safety checks pass. |
 | `auto_merge` | `true` | Request auto-merge after approvals and CI satisfy all guarded conditions. |
 | `trigger_pipeline_when_missing_or_skipped` | `true` | Start a pipeline when a managed MR has no pipeline or its pipeline was skipped. |
-| `include_projects` | Empty | Empty includes all projects authored by the current user. Use `group/project-a,group/project-b` to restrict the scope. |
 | `max_mr_age_days` | `90` | Only handle MRs updated within the last 90 days, avoiding long-lived branches. |
 | `report_ci_failures` | `true` | Notify the current Claude session when CI fails without retrying failed CI automatically. |
+
+You do not need to configure `include_projects`. By default, the plugin monitors MRs authored by the current `glab` user across all projects. The filter remains available in an explicit JSON configuration file for advanced testing scenarios.
 
 The safety checks still apply with the recommended settings. The plugin does not advance MRs with missing approvals, unresolved discussions, code conflicts, or rebases that would reset approvals. Failed or canceled CI is reported but never retried automatically.
 
@@ -71,6 +72,7 @@ The safety checks still apply with the recommended settings. The plugin does not
 
 - **Marketplace installation:** no JSON file is required. Claude Code automatically stores values supplied through installation-time `--config` arguments or the configuration dialog shown when the plugin is enabled.
 - **`/gitlab-mr-guardian:setup`:** checks `glab` authentication, shows the effective settings, and performs a read-only status check. It does not create or modify files in the application repository.
+- **Monitoring control:** the `start` / `stop` state is stored in `${CLAUDE_PLUGIN_DATA}`, defaults to stopped, and persists across Claude sessions without changing installation configuration.
 - **Reconfiguration:** open `/plugin` → Installed → GitLab MR Guardian, change its options, and run `/reload-plugins`. Restart the session for Monitor configuration changes to take full effect.
 - **`--plugin-dir` development mode:** normally uses plugin defaults and infers the host from the Git remote. A user-level development configuration file is needed only when testing the standalone script outside Claude Code, as described below.
 
@@ -124,13 +126,17 @@ For a regular installation, configuration comes from the `userConfig` declaratio
 /gitlab-mr-guardian:setup
 /gitlab-mr-guardian:status
 /gitlab-mr-guardian:check
+/gitlab-mr-guardian:start
+/gitlab-mr-guardian:stop
 ```
 
 - `setup`: verify authentication, explain the effective configuration, and run a read-only status check; it does not create a configuration file.
 - `status`: inspect the current MR state without making changes.
 - `check`: immediately run one configured and guarded advancement cycle.
+- `start`: begin background polling; the control state persists across sessions.
+- `stop`: stop new background polling while keeping all manual commands available.
 
-The background Monitor starts automatically when the plugin is enabled. It polls once per hour by default and only notifies Claude when state changes. Set `poll_interval_seconds` while installing or reconfiguring the plugin to customize the interval from 60 to 86400 seconds.
+Background monitoring is stopped by default. After `start`, an active Claude session begins polling within a few seconds, once per hour by default, and only notifies Claude when state changes. After `stop`, no new automatic cycle begins, although an individual GitLab request already in flight may finish. Use `poll_interval_seconds` to customize the interval from 60 to 86400 seconds.
 
 ## Safety boundaries
 
@@ -144,7 +150,7 @@ The background Monitor starts automatically when the plugin is enabled. It polls
 
 ## Session scope
 
-The Claude Code plugin Monitor belongs only to the interactive session that started it. Poll results and CI alerts are delivered to that session and are not propagated, synchronized, or broadcast to other Claude Code sessions.
+After `start`, the Claude Code plugin Monitor belongs only to the interactive session that acquires the runtime lock. Poll results and CI alerts are delivered to that session and are not propagated, synchronized, or broadcast to other Claude Code sessions.
 
 If several Claude Code sessions with this plugin enabled are open at the same time, a process lock prevents duplicate actions against the same GitLab host. The session holding the lock performs monitoring and receives notifications; other sessions do not receive those notifications. If the monitoring session closes, another running session can take over on its next polling cycle.
 

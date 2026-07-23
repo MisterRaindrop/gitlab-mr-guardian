@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -192,6 +193,92 @@ class GuardianCycleTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_project_filter_is_optional_and_not_in_native_user_config(self):
+        manifest_path = SCRIPT.parents[1] / ".claude-plugin" / "plugin.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertNotIn("include_projects", manifest["userConfig"])
+        self.assertNotIn("monitor_enabled", manifest["userConfig"])
+        self.assertEqual(guardian.validate_config({})["include_projects"], [])
+
+    def test_monitor_command_passes_hostname_and_plugin_data_explicitly(self):
+        monitor_path = SCRIPT.parents[1] / "monitors" / "monitors.json"
+        monitor = json.loads(monitor_path.read_text(encoding="utf-8"))[0]
+
+        self.assertIn("${user_config.hostname}", monitor["command"])
+        self.assertIn("${CLAUDE_PLUGIN_DATA}", monitor["command"])
+        self.assertIn("--runtime-hostname", monitor["command"])
+
+    def test_monitor_control_defaults_to_stopped_and_persists(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            loaded = guardian.validate_config({"plugin_data_dir": temporary})
+
+            self.assertFalse(guardian.monitor_control_enabled(loaded))
+            guardian.set_monitor_control(loaded, True)
+            self.assertTrue(guardian.monitor_control_enabled(loaded))
+            guardian.set_monitor_control(loaded, False)
+            self.assertFalse(guardian.monitor_control_enabled(loaded))
+
+    def test_start_and_stop_commands_toggle_monitor_control(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            start_args = guardian.build_parser().parse_args(
+                ["--plugin-data-dir", temporary, "start"]
+            )
+            stop_args = guardian.build_parser().parse_args(
+                ["--plugin-data-dir", temporary, "stop"]
+            )
+            loaded = guardian.validate_config({"plugin_data_dir": temporary})
+
+            with patch.object(guardian, "emit"):
+                self.assertEqual(
+                    guardian.command_start_or_stop(start_args, enabled=True),
+                    0,
+                )
+                self.assertTrue(guardian.monitor_control_enabled(loaded))
+                self.assertEqual(
+                    guardian.command_start_or_stop(stop_args, enabled=False),
+                    0,
+                )
+                self.assertFalse(guardian.monitor_control_enabled(loaded))
+
+    def test_runtime_arguments_override_missing_plugin_environment(self):
+        args = guardian.build_parser().parse_args(
+            [
+                "--plugin-data-dir",
+                "/tmp/guardian-plugin-data",
+                "--runtime-hostname",
+                "gitlab.example.com",
+                "--runtime-poll-interval-seconds",
+                "1800",
+                "--runtime-auto-rebase",
+                "true",
+                "--runtime-auto-merge",
+                "false",
+                "--runtime-trigger-pipeline-when-missing-or-skipped",
+                "true",
+                "--runtime-max-mr-age-days",
+                "90",
+                "--runtime-report-ci-failures",
+                "true",
+                "status",
+            ]
+        )
+        with patch.object(
+            guardian,
+            "load_config",
+            return_value=(guardian.validate_config({}), None, "built-in-defaults"),
+        ):
+            loaded, _path, _source = guardian.load_runtime_config(args)
+
+        self.assertEqual(loaded["hostname"], "gitlab.example.com")
+        self.assertEqual(loaded["poll_interval_seconds"], 1800)
+        self.assertTrue(loaded["auto_rebase"])
+        self.assertFalse(loaded["auto_merge"])
+        self.assertEqual(
+            loaded["plugin_data_dir"],
+            "/tmp/guardian-plugin-data",
+        )
+
     def test_default_poll_interval_is_one_hour(self):
         loaded = guardian.validate_config({})
 
@@ -255,7 +342,7 @@ class ConfigurationTests(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True):
             path = guardian.state_path({"hostname": "gitlab.example.com"})
 
-        self.assertEqual(path.parent, Path("/tmp/example-plugin-data"))
+        self.assertEqual(path.parent, Path("/tmp/example-plugin-data").resolve())
         self.assertTrue(path.name.startswith("state-"))
         self.assertEqual(path.suffix, ".json")
 
