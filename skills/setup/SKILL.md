@@ -36,7 +36,7 @@ argument-hint: [GitLab hostname]
 
    This writes `settings.json` inside `${CLAUDE_PLUGIN_DATA}`. The background monitor and all other commands read configuration from this file; native plugin userConfig substitution is not used. Never create or edit configuration inside the user's repository.
 
-   Optional managed-rule extensions (all off by default) can be set the same way: `--retry-failed-pipeline-once true` (retry a failed pipeline's jobs once per pipeline for approved MRs), `--rebase-when-ci-failed true` (allow safe rebase for `need_rebase` MRs even while CI is failed, missing, or skipped), and `--advisory-reviewers <bot,names>` (comma-separated usernames, e.g. AI review bots, whose unresolved discussions are advisory and never block automation). Explain the behavior change and confirm before enabling any of them unless the user already explicitly requested it.
+   Optional managed-rule extensions (all off by default) can be set the same way: `--manage-all-approved true` (manage every approved MR with no blocking discussions, without requiring a previously successful pipeline), `--retry-failed-pipeline-once true` (retry a failed pipeline's jobs once per pipeline for approved MRs), `--rebase-when-ci-failed true` (allow safe rebase for `need_rebase` MRs even while CI is failed, missing, or skipped), and `--advisory-reviewers <bot,names>` (comma-separated usernames, e.g. AI review bots, whose unresolved discussions are advisory and never block automation). Explain the behavior change and confirm before enabling any of them unless the user already explicitly requested it.
 
 6. Run a read-only status check and summarize which merge requests are monitored, paused for review, waiting for CI, or blocked:
 

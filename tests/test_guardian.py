@@ -302,6 +302,64 @@ class GuardianCycleTests(unittest.TestCase):
         self.assertEqual(rows[0]["advisory_unresolved"], 1)
         self.assertEqual(client.mutations, [])
 
+    def test_manage_all_approved_refreshes_pipeline_without_history(self):
+        mr = base_mr(
+            head_pipeline={
+                "id": 56,
+                "status": "skipped",
+                "web_url": "https://gitlab.example.com/team/project/-/pipelines/56",
+            }
+        )
+        # No successful pipeline anywhere in the MR's history.
+        history = [{"id": 56, "status": "skipped", "sha": "abc123"}]
+
+        client = FakeClient(mr, pipeline_history=history)
+        rows, events = guardian.run_cycle(
+            client,
+            config(manage_all_approved=True),
+            guardian.StateStore(Path("/tmp/unused-guardian-state.json")),
+            mutate=True,
+        )
+
+        self.assertEqual(rows[0]["phase"], "pipeline_requested")
+        self.assertTrue(rows[0]["managed"])
+        self.assertEqual(client.mutations, [("pipeline", None)])
+
+        # Default configuration still requires a previously successful pipeline.
+        client = FakeClient(mr, pipeline_history=history)
+        rows, events = guardian.run_cycle(
+            client,
+            config(),
+            guardian.StateStore(Path("/tmp/unused-2.json")),
+            mutate=True,
+        )
+
+        self.assertEqual(rows[0]["phase"], "waiting_for_successful_ci")
+        self.assertFalse(rows[0]["managed"])
+        self.assertEqual(client.mutations, [])
+
+    def test_manage_all_approved_reports_ci_failure_without_history(self):
+        mr = base_mr(
+            detailed_merge_status="ci_must_pass",
+            head_pipeline={
+                "id": 56,
+                "status": "failed",
+                "web_url": "https://gitlab.example.com/team/project/-/pipelines/56",
+            },
+        )
+        client = FakeClient(mr)
+        rows, events = guardian.run_cycle(
+            client,
+            config(manage_all_approved=True),
+            guardian.StateStore(Path("/tmp/unused-guardian-state.json")),
+            mutate=True,
+        )
+
+        self.assertEqual(rows[0]["phase"], "waiting_for_successful_ci")
+        self.assertTrue(rows[0]["managed"])
+        self.assertEqual(client.mutations, [])
+        self.assertEqual([event["event"] for event in events], ["CI_FAILED"])
+
     def test_old_merge_request_is_out_of_scope_by_default(self):
         client = FakeClient(base_mr(updated_at="2020-01-01T00:00:00+00:00"))
         state = guardian.StateStore(Path("/tmp/unused-guardian-state.json"))

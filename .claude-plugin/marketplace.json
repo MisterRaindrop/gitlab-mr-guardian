@@ -9,7 +9,7 @@
       "name": "gitlab-mr-guardian",
       "source": "./",
       "description": "Monitor approved GitLab merge requests, safely refresh CI, rebase stale branches, and request auto-merge.",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "tags": [
         "gitlab",
         "merge-request",

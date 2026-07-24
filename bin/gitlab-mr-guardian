@@ -43,6 +43,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "report_ci_failures": True,
     "retry_failed_pipeline_once": False,
     "rebase_when_ci_failed": False,
+    "manage_all_approved": False,
     "advisory_reviewers": [],
 }
 
@@ -67,6 +68,7 @@ SETTINGS_SUMMARY_FIELDS = (
     "report_ci_failures",
     "retry_failed_pipeline_once",
     "rebase_when_ci_failed",
+    "manage_all_approved",
     "advisory_reviewers",
     "include_projects",
     "exclude_projects",
@@ -261,6 +263,7 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "report_ci_failures",
         "retry_failed_pipeline_once",
         "rebase_when_ci_failed",
+        "manage_all_approved",
     )
     for field in bool_fields:
         if not isinstance(result[field], bool):
@@ -802,7 +805,12 @@ def run_cycle(
                 approvals, config["require_at_least_one_approval"]
             )
             historical_success = False
-            if approved and not managed_before and pipeline["status"] != "success":
+            if (
+                approved
+                and not managed_before
+                and not config["manage_all_approved"]
+                and pipeline["status"] != "success"
+            ):
                 history = list_mr_pipelines(client, mr)
                 historical_success = any(
                     item.get("status") == "success" for item in history
@@ -878,9 +886,12 @@ def run_cycle(
                 state.data["mrs"][key] = {**row, "sha": mr.get("sha")}
                 continue
 
+            # Past this point the MR is approved with no blocking discussions.
             managed_from_history = approved and historical_success
+            managed_by_policy = approved and config["manage_all_approved"]
             if (
-                managed_from_history
+                (managed_from_history or managed_by_policy)
+                and not managed_before
                 and config["report_ci_failures"]
                 and pipeline["status"] in FAILED_PIPELINE_STATES
             ):
@@ -897,7 +908,7 @@ def run_cycle(
                     )
 
             if pipeline["status"] != "success":
-                managed = managed_before or managed_from_history
+                managed = managed_before or managed_from_history or managed_by_policy
                 phase = "waiting_for_successful_ci"
                 if pipeline["status"] in RUNNING_PIPELINE_STATES:
                     phase = "ci_running"
@@ -1119,6 +1130,7 @@ def collect_configure_updates(args: argparse.Namespace) -> Dict[str, Any]:
         "report_ci_failures",
         "retry_failed_pipeline_once",
         "rebase_when_ci_failed",
+        "manage_all_approved",
     ):
         value = getattr(args, attribute, None)
         if value is not None:
@@ -1391,6 +1403,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Allow the safe rebase flow for need_rebase MRs even while the current "
             "pipeline is failed, missing, or skipped (requires auto_rebase)."
+        ),
+    )
+    configure_parser.add_argument(
+        "--manage-all-approved",
+        choices=("true", "false"),
+        help=(
+            "Manage every approved MR with no blocking discussions, without "
+            "requiring a previously successful pipeline."
         ),
     )
     configure_parser.add_argument(

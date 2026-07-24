@@ -67,6 +67,7 @@ claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
 
 | 配置项 | 默认 | 作用 |
 | --- | --- | --- |
+| `manage_all_approved` | `false` | 已审批且无阻塞讨论的 MR 直接纳入托管，不再要求历史上存在成功 Pipeline。托管后缺失/跳过的 Pipeline 会补跑，CI 失败会按下述规则重试或报告；冲突、审批丢失等明确错误仍会暂停并报告。 |
 | `retry_failed_pipeline_once` | `false` | 已审批且无阻塞讨论的 MR，CI 失败时对同一条流水线自动重试一次（只重跑失败的 Job），用于偶发的环境类失败。重试后仍失败视为真实回归，只报告、不再重试。 |
 | `rebase_when_ci_failed` | `false` | GitLab 返回 `need_rebase` 但当前 CI 失败、缺失或被跳过时，也允许执行安全 rebase（rebase 会在新基线上触发全新 CI）。需同时开启 `auto_rebase`，审批保护检查照常生效。 |
 | `advisory_reviewers` | `[]` | 这些用户名（例如 AI Review 机器人）发起的未解决讨论视为参考意见，不阻塞自动操作；数量会以 `advisory_unresolved` 字段出现在状态输出中。任何其他账号的未解决讨论（包括在 AI 线程中的人工回复）仍然阻塞。 |
@@ -77,6 +78,7 @@ claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
 "${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" \
   --plugin-data-dir "${CLAUDE_PLUGIN_DATA}" \
   configure \
+  --manage-all-approved true \
   --retry-failed-pipeline-once true \
   --rebase-when-ci-failed true \
   --advisory-reviewers ai-review-bot
@@ -166,7 +168,7 @@ claude --plugin-dir ./gitlab-mr-guardian
 - `auto_rebase` 和 `auto_merge` 必须在插件配置中显式启用。
 - 默认只处理最近 90 天内有更新的 MR，避免误碰长期遗留的开放分支；设为 `0` 才会取消时间限制。
 - Rebase 仅在 GitLab 返回 `need_rebase` 时执行，不会为了“保持新鲜”而反复创建提交。
-- 只有已受监控或历史上存在成功 Pipeline 的 MR，才会在当前 Pipeline 为 `missing/skipped` 时补跑。`failed/canceled` 默认只报告；显式开启 `retry_failed_pipeline_once` 后，同一条流水线最多自动重试一次，重试后仍失败只报告。
+- 默认只有已受监控或历史上存在成功 Pipeline 的 MR，才会在当前 Pipeline 为 `missing/skipped` 时补跑；开启 `manage_all_approved` 后，所有已审批且无阻塞讨论的 MR 都纳入托管。`failed/canceled` 默认只报告；显式开启 `retry_failed_pipeline_once` 后，同一条流水线最多自动重试一次，重试后仍失败只报告。
 - 人类评审的未解决讨论始终阻塞自动操作；只有显式列入 `advisory_reviewers` 的账号（如 AI Review 机器人）的讨论被视为参考。
 - 如果项目启用了 `reset_approvals_on_push`，默认禁止自动 rebase，因为它可能清除已有审批。
 - Auto-merge 请求携带当前 MR SHA，避免审查过的提交与被合并提交不一致。

@@ -16,5 +16,6 @@
   "report_ci_failures": true,
   "retry_failed_pipeline_once": false,
   "rebase_when_ci_failed": false,
+  "manage_all_approved": false,
   "advisory_reviewers": []
 }

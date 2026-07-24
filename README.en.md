@@ -67,6 +67,7 @@ You do not need to configure `include_projects`. By default, the plugin monitors
 
 | Option | Default | Purpose |
 | --- | --- | --- |
+| `manage_all_approved` | `false` | Manage every approved MR with no blocking discussions directly, without requiring a previously successful pipeline. Managed MRs get missing/skipped pipelines refreshed and failed CI retried or reported per the rules below; explicit errors such as conflicts or lost approvals still pause and report. |
 | `retry_failed_pipeline_once` | `false` | For approved MRs with no blocking discussions, retry the failed jobs of the current pipeline once per pipeline, targeting flaky environment failures. A failure after the retry is treated as a real regression: reported, never retried again. |
 | `rebase_when_ci_failed` | `false` | Allow the safe rebase flow when GitLab reports `need_rebase` while the current pipeline is failed, missing, or skipped (the rebase triggers a fresh pipeline on the new base). Requires `auto_rebase`; all approval safety checks still apply. |
 | `advisory_reviewers` | `[]` | Unresolved discussions started by these usernames (for example AI review bots) are advisory and never block automation; their count appears as `advisory_unresolved` in status output. Unresolved notes from any other account — including human replies inside an AI thread — still block. |
@@ -77,6 +78,7 @@ Enable them through setup or the `configure` subcommand, for example:
 "${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" \
   --plugin-data-dir "${CLAUDE_PLUGIN_DATA}" \
   configure \
+  --manage-all-approved true \
   --retry-failed-pipeline-once true \
   --rebase-when-ci-failed true \
   --advisory-reviewers ai-review-bot
@@ -166,7 +168,7 @@ Background monitoring is stopped by default. After `start`, an active Claude ses
 - `auto_rebase` and `auto_merge` must be explicitly enabled in the plugin configuration.
 - By default, the plugin only handles MRs updated within the last 90 days to avoid touching long-lived branches. Set the limit to `0` to disable it.
 - A rebase is requested only when GitLab reports `need_rebase`; the plugin does not repeatedly create commits merely to keep a branch fresh.
-- A missing or skipped pipeline is refreshed only when the MR is already managed or has a previously successful pipeline. Failed or canceled pipelines are reported by default; with `retry_failed_pipeline_once` explicitly enabled, each pipeline is retried at most once, and a post-retry failure is only reported.
+- By default a missing or skipped pipeline is refreshed only when the MR is already managed or has a previously successful pipeline; with `manage_all_approved` enabled, every approved MR with no blocking discussions is managed. Failed or canceled pipelines are reported by default; with `retry_failed_pipeline_once` explicitly enabled, each pipeline is retried at most once, and a post-retry failure is only reported.
 - Unresolved discussions from human reviewers always block automation; only accounts explicitly listed in `advisory_reviewers` (such as AI review bots) are treated as advisory.
 - Automatic rebase is blocked by default when a project uses `reset_approvals_on_push`, because the rebase could clear existing approvals.
 - Auto-merge requests include the current MR SHA so the reviewed commit and merged commit cannot silently diverge.
