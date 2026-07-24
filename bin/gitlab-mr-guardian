@@ -910,11 +910,12 @@ def run_cycle(
             if pipeline["status"] != "success":
                 managed = managed_before or managed_from_history or managed_by_policy
                 phase = "waiting_for_successful_ci"
-                if pipeline["status"] in RUNNING_PIPELINE_STATES:
-                    phase = "ci_running"
-                elif mr.get("rebase_in_progress"):
+                if mr.get("rebase_in_progress"):
                     phase = "rebasing"
                 elif status == "need_rebase" and config["rebase_when_ci_failed"]:
+                    # Rebase first even while CI is still running: the running
+                    # pipeline is built on the stale base, so its result is
+                    # outdated either way and the rebase triggers a fresh one.
                     phase = "needs_rebase"
                     if mutate and config["auto_rebase"]:
                         phase = attempt_safe_rebase(
@@ -922,6 +923,8 @@ def run_cycle(
                         )
                         if phase == "rebase_requested":
                             managed = True
+                elif pipeline["status"] in RUNNING_PIPELINE_STATES:
+                    phase = "ci_running"
                 elif (
                     pipeline["status"] in FAILED_PIPELINE_STATES
                     and config["retry_failed_pipeline_once"]
@@ -1401,8 +1404,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--rebase-when-ci-failed",
         choices=("true", "false"),
         help=(
-            "Allow the safe rebase flow for need_rebase MRs even while the current "
-            "pipeline is failed, missing, or skipped (requires auto_rebase)."
+            "Allow the safe rebase flow for need_rebase MRs while the current "
+            "pipeline is not yet successful — failed, running, missing, or "
+            "skipped (requires auto_rebase)."
         ),
     )
     configure_parser.add_argument(

@@ -85,7 +85,7 @@ claude plugin update gitlab-mr-guardian@gitlab-mr-guardian-marketplace
 | --- | --- | --- |
 | `manage_all_approved` | `false` | 已审批且无阻塞讨论的 MR 直接纳入托管，不再要求历史上存在成功 Pipeline。托管后缺失/跳过的 Pipeline 会补跑，CI 失败会按下述规则重试或报告；冲突、审批丢失等明确错误仍会暂停并报告。 |
 | `retry_failed_pipeline_once` | `false` | 已审批且无阻塞讨论的 MR，CI 失败时对同一条流水线自动重试一次（只重跑失败的 Job），用于偶发的环境类失败。重试后仍失败视为真实回归，只报告、不再重试。 |
-| `rebase_when_ci_failed` | `false` | GitLab 返回 `need_rebase` 但当前 CI 失败、缺失或被跳过时，也允许执行安全 rebase（rebase 会在新基线上触发全新 CI）。需同时开启 `auto_rebase`，审批保护检查照常生效。 |
+| `rebase_when_ci_failed` | `false` | GitLab 返回 `need_rebase` 但当前 CI 尚未成功（失败、运行中、缺失或被跳过）时，也允许执行安全 rebase。正在运行的 CI 基于旧基线，结果注定过期，因此优先 rebase、由新基线触发全新 CI。需同时开启 `auto_rebase`，审批保护检查照常生效。 |
 | `advisory_reviewers` | `[]` | 这些用户名（例如 AI Review 机器人）发起的未解决讨论视为参考意见，不阻塞自动操作；数量会以 `advisory_unresolved` 字段出现在状态输出中。任何其他账号的未解决讨论（包括在 AI 线程中的人工回复）仍然阻塞。 |
 
 通过 setup 或 `configure` 子命令启用，例如：

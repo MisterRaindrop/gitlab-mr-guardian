@@ -242,6 +242,58 @@ class GuardianCycleTests(unittest.TestCase):
         self.assertEqual(rows[0]["phase"], "waiting_for_successful_ci")
         self.assertEqual(client.mutations, [])
 
+    def test_need_rebase_takes_priority_over_running_ci(self):
+        mr = base_mr(
+            detailed_merge_status="need_rebase",
+            head_pipeline={
+                "id": 56,
+                "status": "running",
+                "web_url": "https://gitlab.example.com/team/project/-/pipelines/56",
+            },
+        )
+
+        client = FakeClient(mr)
+        rows, events = guardian.run_cycle(
+            client,
+            config(rebase_when_ci_failed=True),
+            guardian.StateStore(Path("/tmp/unused-guardian-state.json")),
+            mutate=True,
+        )
+
+        self.assertEqual(rows[0]["phase"], "rebase_requested")
+        self.assertEqual(client.mutations, [("rebase", None)])
+        self.assertEqual(events[0]["event"], "REBASE_REQUESTED")
+
+        # With the flag off, a running pipeline is still just waited on.
+        client = FakeClient(mr)
+        rows, events = guardian.run_cycle(
+            client,
+            config(),
+            guardian.StateStore(Path("/tmp/unused-2.json")),
+            mutate=True,
+        )
+
+        self.assertEqual(rows[0]["phase"], "ci_running")
+        self.assertEqual(client.mutations, [])
+
+        # A rebase already in progress is never interrupted by another request.
+        client = FakeClient(
+            base_mr(
+                detailed_merge_status="need_rebase",
+                rebase_in_progress=True,
+                head_pipeline={"id": 56, "status": "running", "web_url": None},
+            )
+        )
+        rows, events = guardian.run_cycle(
+            client,
+            config(rebase_when_ci_failed=True),
+            guardian.StateStore(Path("/tmp/unused-3.json")),
+            mutate=True,
+        )
+
+        self.assertEqual(rows[0]["phase"], "rebasing")
+        self.assertEqual(client.mutations, [])
+
     def test_advisory_reviewer_discussions_do_not_block(self):
         mr = base_mr(detailed_merge_status="discussions_not_resolved")
         client = FakeClient(
