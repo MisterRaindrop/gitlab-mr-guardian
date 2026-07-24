@@ -34,21 +34,18 @@ Run the following commands in a terminal:
 ```bash
 claude plugin marketplace add MisterRaindrop/gitlab-mr-guardian
 claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
-  --scope user \
-  --config hostname=gitlab.example.com \
-  --config poll_interval_seconds=3600 \
-  --config auto_rebase=true \
-  --config auto_merge=true \
-  --config trigger_pipeline_when_missing_or_skipped=true \
-  --config max_mr_age_days=90 \
-  --config report_ci_failures=true
+  --scope user
 ```
 
-These settings allow the plugin to rebase and request auto-merge, so confirm that both actions comply with your team's rules. Background monitoring remains stopped after installation and starting Claude does not contact GitLab. Run `/gitlab-mr-guardian:start` explicitly in Claude Code to begin automatic polling, and `/gitlab-mr-guardian:stop` to stop it. Manual `/check` remains available regardless of the monitoring state.
+After installation, run the setup command once inside Claude Code to persist the GitLab host and safety options into the plugin data directory:
 
-Options omitted from `--config` use the safe defaults declared by the plugin. After installation, open the Installed page under `/plugin` to configure the plugin. Run `/reload-plugins` after installing or changing configuration in an existing session.
+```text
+/gitlab-mr-guardian:setup gitlab.example.com
+```
 
-With `--scope user`, Claude Code automatically stores the options in user-level settings rather than the current application repository. You do not need to create a configuration file manually, and `/gitlab-mr-guardian:setup` does not create repository configuration files. You can also use the `/plugin` interface for the entire marketplace, installation, and management flow.
+`setup` verifies `glab` authentication, persists the configuration into `${CLAUDE_PLUGIN_DATA}/settings.json`, and performs a read-only status check. `auto_rebase` and `auto_merge` default to off; enabling them allows the plugin to rewrite source branches and merge code, so confirm that both actions comply with your team's rules.
+
+Background monitoring remains stopped after installation and starting Claude does not contact GitLab. Run `/gitlab-mr-guardian:start` explicitly in Claude Code to begin automatic polling, and `/gitlab-mr-guardian:stop` to stop it. Manual `/check` remains available regardless of the monitoring state. You can also use the `/plugin` interface for the entire marketplace, installation, and management flow.
 
 ## Recommended configuration
 
@@ -66,14 +63,35 @@ The following settings best match the plugin's primary goal: keep reviewed MRs m
 
 You do not need to configure `include_projects`. By default, the plugin monitors MRs authored by the current `glab` user across all projects. The filter remains available in an explicit JSON configuration file for advanced testing scenarios.
 
+### Optional managed-rule extensions (all off by default)
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `retry_failed_pipeline_once` | `false` | For approved MRs with no blocking discussions, retry the failed jobs of the current pipeline once per pipeline, targeting flaky environment failures. A failure after the retry is treated as a real regression: reported, never retried again. |
+| `rebase_when_ci_failed` | `false` | Allow the safe rebase flow when GitLab reports `need_rebase` while the current pipeline is failed, missing, or skipped (the rebase triggers a fresh pipeline on the new base). Requires `auto_rebase`; all approval safety checks still apply. |
+| `advisory_reviewers` | `[]` | Unresolved discussions started by these usernames (for example AI review bots) are advisory and never block automation; their count appears as `advisory_unresolved` in status output. Unresolved notes from any other account — including human replies inside an AI thread — still block. |
+
+Enable them through setup or the `configure` subcommand, for example:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" \
+  --plugin-data-dir "${CLAUDE_PLUGIN_DATA}" \
+  configure \
+  --retry-failed-pipeline-once true \
+  --rebase-when-ci-failed true \
+  --advisory-reviewers ai-review-bot
+```
+
+Note: when a GitLab project requires all threads to be resolved before merging, GitLab itself still refuses the merge even though the plugin treats AI threads as advisory; resolve the threads or adjust the project setting.
+
 The safety checks still apply with the recommended settings. The plugin does not advance MRs with missing approvals, unresolved discussions, code conflicts, or rebases that would reset approvals. Failed or canceled CI is reported but never retried automatically.
 
 ### How configuration is created
 
-- **Marketplace installation:** no JSON file is required. Claude Code automatically stores values supplied through installation-time `--config` arguments or the configuration dialog shown when the plugin is enabled.
-- **`/gitlab-mr-guardian:setup`:** checks `glab` authentication, shows the effective settings, and performs a read-only status check. It does not create or modify files in the application repository.
-- **Monitoring control:** the `start` / `stop` state is stored in `${CLAUDE_PLUGIN_DATA}`, defaults to stopped, and persists across Claude sessions without changing installation configuration.
-- **Reconfiguration:** open `/plugin` → Installed → GitLab MR Guardian, change its options, and run `/reload-plugins`. Restart the session for Monitor configuration changes to take full effect.
+- **`/gitlab-mr-guardian:setup`:** the single configuration entry point. It verifies `glab` authentication, writes the hostname and safety options into `${CLAUDE_PLUGIN_DATA}/settings.json` (mode 0600), and performs a read-only status check. It does not create or modify files in the application repository.
+- **The background Monitor and all commands read the same `settings.json`.** Starting with Claude Code 2.1.207, Monitor commands no longer receive `${user_config.*}` substitutions or `CLAUDE_PLUGIN_OPTION_*` environment variables, so the plugin maintains its own configuration file. The Monitor re-reads it on every polling cycle, so configuration changes take effect without restarting the session.
+- **Monitoring control:** the `start` / `stop` state is stored in `${CLAUDE_PLUGIN_DATA}/control.json`, defaults to stopped, and persists across Claude sessions.
+- **Reconfiguration:** run `/gitlab-mr-guardian:setup` again, or invoke the `configure` subcommand directly; pass only the options you want to change and the rest stay as they are.
 - **`--plugin-dir` development mode:** normally uses plugin defaults and infers the host from the Git remote. A user-level development configuration file is needed only when testing the standalone script outside Claude Code, as described below.
 
 ## Install from a local Marketplace
@@ -83,12 +101,10 @@ Before publishing, test the complete installation flow using the plugin director
 ```bash
 claude plugin marketplace add /absolute/path/to/gitlab-mr-guardian
 claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
-  --scope user \
-  --config hostname=gitlab.example.com \
-  --config poll_interval_seconds=3600 \
-  --config auto_rebase=true \
-  --config auto_merge=true
+  --scope user
 ```
+
+Configure it the same way with `/gitlab-mr-guardian:setup` after installation.
 
 The path must be absolute or relative to the directory from which Claude Code was started.
 
@@ -113,12 +129,19 @@ The default path is `$XDG_CONFIG_HOME/gitlab-mr-guardian/config.json`, or `~/.co
 
 ## Configuration and state
 
-For a regular installation, configuration comes from the `userConfig` declaration in `.claude-plugin/plugin.json`. Claude Code stores non-sensitive options in the plugin configuration area of the user-level `~/.claude/settings.json` and exports them to the plugin process as environment variables.
+For a regular installation, configuration lives in `settings.json` inside the persistent `${CLAUDE_PLUGIN_DATA}` directory provided by Claude Code. It is written by `/gitlab-mr-guardian:setup` (the `configure` subcommand), and the background Monitor and every manual command read from it.
+
+Configuration resolution order:
+
+1. An explicit `--config` path or `MR_GUARDIAN_CONFIG` (advanced testing only).
+2. `${CLAUDE_PLUGIN_DATA}/settings.json` (the normal source for installed plugins).
+3. `CLAUDE_PLUGIN_OPTION_*` environment variables exported by older Claude Code versions (< 2.1.207), kept for backward compatibility.
+4. The user-level development file `~/.config/gitlab-mr-guardian/config.json`.
+5. Built-in safe defaults.
 
 - `config.example.json` in the plugin source is only a reference for advanced options, not the runtime configuration.
-- Polling state and event deduplication data are stored in the persistent `${CLAUDE_PLUGIN_DATA}` directory provided by Claude Code.
+- Polling state, event deduplication data, and the monitoring switch are also stored in `${CLAUDE_PLUGIN_DATA}`.
 - The plugin does not write `.claude/`, `.gitignore`, or any other file in the current application repository.
-- Explicit `--config` and `MR_GUARDIAN_CONFIG` values are only intended for advanced testing and compatibility scenarios.
 
 ## Usage
 
@@ -130,7 +153,7 @@ For a regular installation, configuration comes from the `userConfig` declaratio
 /gitlab-mr-guardian:stop
 ```
 
-- `setup`: verify authentication, explain the effective configuration, and run a read-only status check; it does not create a configuration file.
+- `setup`: verify authentication, persist the hostname and safety options into `settings.json` in the plugin data directory, and run a read-only status check.
 - `status`: inspect the current MR state without making changes.
 - `check`: immediately run one configured and guarded advancement cycle.
 - `start`: begin background polling; the control state persists across sessions.
@@ -143,7 +166,8 @@ Background monitoring is stopped by default. After `start`, an active Claude ses
 - `auto_rebase` and `auto_merge` must be explicitly enabled in the plugin configuration.
 - By default, the plugin only handles MRs updated within the last 90 days to avoid touching long-lived branches. Set the limit to `0` to disable it.
 - A rebase is requested only when GitLab reports `need_rebase`; the plugin does not repeatedly create commits merely to keep a branch fresh.
-- A missing or skipped pipeline is refreshed only when the MR is already managed or has a previously successful pipeline. Failed or canceled pipelines are reported but never retried automatically.
+- A missing or skipped pipeline is refreshed only when the MR is already managed or has a previously successful pipeline. Failed or canceled pipelines are reported by default; with `retry_failed_pipeline_once` explicitly enabled, each pipeline is retried at most once, and a post-retry failure is only reported.
+- Unresolved discussions from human reviewers always block automation; only accounts explicitly listed in `advisory_reviewers` (such as AI review bots) are treated as advisory.
 - Automatic rebase is blocked by default when a project uses `reset_approvals_on_push`, because the rebase could clear existing approvals.
 - Auto-merge requests include the current MR SHA so the reviewed commit and merged commit cannot silently diverge.
 - The plugin never retries failed CI automatically and never resolves review feedback or code conflicts automatically.

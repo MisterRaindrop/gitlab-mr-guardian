@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "gitlab-mr-guardian",
   "displayName": "GitLab MR Guardian",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Monitors approved GitLab merge requests, safely rebases stale branches, enables auto-merge, and reports CI failures.",
   "author": {
     "name": "MisterRaindrop"
@@ -18,53 +18,5 @@
   ],
   "experimental": {
     "monitors": "./monitors/monitors.json"
-  },
-  "userConfig": {
-    "hostname": {
-      "type": "string",
-      "title": "GitLab hostname",
-      "description": "GitLab host used by glab. Leave empty to infer it from the current repository remote.",
-      "default": ""
-    },
-    "poll_interval_seconds": {
-      "type": "number",
-      "title": "Polling interval",
-      "description": "Seconds between GitLab checks while Claude Code is running.",
-      "default": 3600,
-      "min": 60,
-      "max": 86400
-    },
-    "auto_rebase": {
-      "type": "boolean",
-      "title": "Automatic rebase",
-      "description": "Rebase eligible MRs only when GitLab reports need_rebase and approval safety checks pass.",
-      "default": false
-    },
-    "auto_merge": {
-      "type": "boolean",
-      "title": "Automatic merge",
-      "description": "Request GitLab auto-merge for eligible MRs after all guarded checks pass.",
-      "default": false
-    },
-    "trigger_pipeline_when_missing_or_skipped": {
-      "type": "boolean",
-      "title": "Refresh skipped pipelines",
-      "description": "Create a new MR pipeline when a monitored MR has no current pipeline or its pipeline was skipped.",
-      "default": true
-    },
-    "max_mr_age_days": {
-      "type": "number",
-      "title": "MR age limit",
-      "description": "Only handle MRs updated within this many days. Use 0 to disable the limit.",
-      "default": 90,
-      "min": 0,
-      "max": 3650
-    },
-    "report_ci_failures": {
-      "type": "boolean",
-      "title": "Report CI failures",
-      "description": "Notify Claude when CI fails for a monitored MR without retrying it automatically.",
-      "default": true
-    }
   }
 }

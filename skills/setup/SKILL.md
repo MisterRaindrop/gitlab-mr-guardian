@@ -1,41 +1,51 @@
 ---
 name: setup
-description: Verify and explain the user-level GitLab MR Guardian configuration. Use when the user asks to initialize, enable, or change automatic MR monitoring, rebasing, auto-merge, project filters, or the GitLab host.
+description: Configure GitLab MR Guardian by persisting the hostname and safety options into the plugin data directory, then verify glab authentication and run a read-only status check. Use when the user asks to initialize, enable, or change automatic MR monitoring, rebasing, auto-merge, project filters, or the GitLab host.
 disable-model-invocation: true
 argument-hint: [GitLab hostname]
 ---
 
 # Set up GitLab MR Guardian
 
-1. Treat Claude Code's native plugin options as the normal configuration source. The configured values include:
-
-   - `hostname`: `${user_config.hostname}`
-   - `auto_rebase`: `${user_config.auto_rebase}`
-   - `auto_merge`: `${user_config.auto_merge}`
-   - `poll_interval_seconds`: `${user_config.poll_interval_seconds}`
-   - `trigger_pipeline_when_missing_or_skipped`: `${user_config.trigger_pipeline_when_missing_or_skipped}`
-   - `max_mr_age_days`: `${user_config.max_mr_age_days}`
-   - `report_ci_failures`: `${user_config.report_ci_failures}`
-
-2. Run `glab auth status`. Add `--hostname "$ARGUMENTS"` when a hostname was supplied; otherwise use the configured hostname when it is non-empty. Never print or request an access token when existing `glab` authentication works.
-3. Explicitly tell the user that marketplace installation creates and stores native plugin configuration automatically. This setup skill does not create a JSON file and must not create or edit configuration inside the user's repository. If plugin options need changing, direct the user to `/plugin`, the installed plugin's configuration flow, or reinstall/re-enable it so Claude Code shows the native `userConfig` dialog.
-4. Explain that automatic rebase changes the source branch and automatic merge can merge code immediately. Obtain confirmation before instructing the user to enable either mutation unless they already explicitly requested it in the current turn.
-5. Run:
+1. Show the currently effective configuration and monitor switch:
 
    ```bash
    "${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" \
      --plugin-data-dir "${CLAUDE_PLUGIN_DATA}" \
-     --runtime-hostname "${user_config.hostname}" \
-     --runtime-poll-interval-seconds "${user_config.poll_interval_seconds}" \
-     --runtime-auto-rebase "${user_config.auto_rebase}" \
-     --runtime-auto-merge "${user_config.auto_merge}" \
-     --runtime-trigger-pipeline-when-missing-or-skipped "${user_config.trigger_pipeline_when_missing_or_skipped}" \
-     --runtime-max-mr-age-days "${user_config.max_mr_age_days}" \
-     --runtime-report-ci-failures "${user_config.report_ci_failures}" \
+     configure
+   ```
+
+   The `CONFIG_SHOW` output includes `config` (effective values) and `monitor_enabled` (the real persistent background-polling switch).
+
+2. Determine the GitLab hostname: use `$ARGUMENTS` when supplied; otherwise keep the already-configured hostname when it is non-empty; otherwise infer it from `git remote get-url origin`; otherwise ask the user.
+
+3. Run `glab auth status --hostname <hostname>`. If it reports a token problem, do not stop there: confirm with a real read call such as `glab api user --hostname <hostname>`, because `glab auth status` can report an invalid token while API access still works. Never print or request an access token when `glab` API calls succeed. Warn the user that write operations (rebase, pipeline trigger, auto-merge) may still fail if the token lacks `api` scope.
+
+4. Explain that automatic rebase changes the source branch and automatic merge can merge code immediately. Obtain confirmation before enabling either mutation unless the user already explicitly requested it in the current turn.
+
+5. Persist the configuration into the plugin data directory. Pass only the options the user chose to set; omitted options keep their previous or default values:
+
+   ```bash
+   "${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" \
+     --plugin-data-dir "${CLAUDE_PLUGIN_DATA}" \
+     configure \
+     --hostname "<hostname>" \
+     --auto-rebase false \
+     --auto-merge false
+   ```
+
+   This writes `settings.json` inside `${CLAUDE_PLUGIN_DATA}`. The background monitor and all other commands read configuration from this file; native plugin userConfig substitution is not used. Never create or edit configuration inside the user's repository.
+
+   Optional managed-rule extensions (all off by default) can be set the same way: `--retry-failed-pipeline-once true` (retry a failed pipeline's jobs once per pipeline for approved MRs), `--rebase-when-ci-failed true` (allow safe rebase for `need_rebase` MRs even while CI is failed, missing, or skipped), and `--advisory-reviewers <bot,names>` (comma-separated usernames, e.g. AI review bots, whose unresolved discussions are advisory and never block automation). Explain the behavior change and confirm before enabling any of them unless the user already explicitly requested it.
+
+6. Run a read-only status check and summarize which merge requests are monitored, paused for review, waiting for CI, or blocked:
+
+   ```bash
+   "${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" \
+     --plugin-data-dir "${CLAUDE_PLUGIN_DATA}" \
      status
    ```
 
-   Summarize which merge requests are monitored, paused for review, waiting for CI, or blocked.
-6. Tell the user that background polling is stopped by default, starts only after `/gitlab-mr-guardian:start`, and runs only while an interactive Claude Code session is open.
+7. Report the real monitoring state from the `monitor_enabled` field of the `CONFIG_SAVED` output — do not assume polling is off. If it is `true`, background polling is already active and will pick up the new configuration on its next cycle. If it is `false`, tell the user that `/gitlab-mr-guardian:start` enables background polling and `/gitlab-mr-guardian:stop` disables it; polling runs only while an interactive Claude Code session is open.
 
 Do not weaken approval or unresolved-discussion checks. Do not enable `allow_rebase_that_resets_approvals` unless the user explicitly accepts that a rebase can invalidate approvals.

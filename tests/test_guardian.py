@@ -75,6 +75,9 @@ class FakeClient:
                 "status": "pending",
                 "web_url": "https://gitlab.example.com/team/project/-/pipelines/57",
             }
+        if endpoint.endswith("/retry") and method == "POST":
+            self.mutations.append(("retry", fields))
+            return {"id": 56, "status": "pending"}
         if endpoint.endswith("/rebase") and method == "PUT":
             self.mutations.append(("rebase", fields))
             return None
@@ -181,6 +184,124 @@ class GuardianCycleTests(unittest.TestCase):
         self.assertEqual(client.mutations, [("pipeline", None)])
         self.assertEqual(events[0]["event"], "PIPELINE_REQUESTED")
 
+    def test_failed_ci_is_retried_once_per_pipeline_when_enabled(self):
+        mr = base_mr(
+            detailed_merge_status="ci_must_pass",
+            head_pipeline={
+                "id": 56,
+                "status": "failed",
+                "web_url": "https://gitlab.example.com/team/project/-/pipelines/56",
+            },
+        )
+        state = guardian.StateStore(Path("/tmp/unused-guardian-state.json"))
+        policy = config(retry_failed_pipeline_once=True)
+
+        client = FakeClient(mr)
+        rows, events = guardian.run_cycle(client, policy, state, mutate=True)
+
+        self.assertEqual(rows[0]["phase"], "pipeline_retry_requested")
+        self.assertTrue(rows[0]["managed"])
+        self.assertEqual(client.mutations, [("retry", None)])
+        self.assertEqual(events[0]["event"], "PIPELINE_RETRY_REQUESTED")
+
+        # The same pipeline fails again after the retry: report only, no second retry.
+        client = FakeClient(mr)
+        rows, events = guardian.run_cycle(client, policy, state, mutate=True)
+
+        self.assertEqual(rows[0]["phase"], "waiting_for_successful_ci")
+        self.assertEqual(client.mutations, [])
+        self.assertEqual([event["event"] for event in events], ["CI_FAILED"])
+
+    def test_need_rebase_with_failed_ci_rebases_when_enabled(self):
+        mr = base_mr(
+            detailed_merge_status="need_rebase",
+            head_pipeline={
+                "id": 56,
+                "status": "failed",
+                "web_url": "https://gitlab.example.com/team/project/-/pipelines/56",
+            },
+        )
+        state = guardian.StateStore(Path("/tmp/unused-guardian-state.json"))
+
+        client = FakeClient(mr)
+        rows, events = guardian.run_cycle(
+            client, config(rebase_when_ci_failed=True), state, mutate=True
+        )
+
+        self.assertEqual(rows[0]["phase"], "rebase_requested")
+        self.assertTrue(rows[0]["managed"])
+        self.assertEqual(client.mutations, [("rebase", None)])
+        self.assertEqual(events[0]["event"], "REBASE_REQUESTED")
+
+        # Default configuration leaves the MR untouched.
+        client = FakeClient(mr)
+        rows, events = guardian.run_cycle(
+            client, config(), guardian.StateStore(Path("/tmp/unused-2.json")), mutate=True
+        )
+
+        self.assertEqual(rows[0]["phase"], "waiting_for_successful_ci")
+        self.assertEqual(client.mutations, [])
+
+    def test_advisory_reviewer_discussions_do_not_block(self):
+        mr = base_mr(detailed_merge_status="discussions_not_resolved")
+        client = FakeClient(
+            mr,
+            discussions=[
+                {
+                    "notes": [
+                        {
+                            "resolvable": True,
+                            "resolved": False,
+                            "author": {"username": "AI-Reviewer"},
+                        }
+                    ]
+                },
+            ],
+        )
+        state = guardian.StateStore(Path("/tmp/unused-guardian-state.json"))
+
+        rows, events = guardian.run_cycle(
+            client, config(advisory_reviewers=["ai-reviewer"]), state, mutate=True
+        )
+
+        self.assertEqual(rows[0]["phase"], "merged")
+        self.assertEqual(rows[0]["advisory_unresolved"], 1)
+        self.assertEqual(
+            client.mutations,
+            [("merge", {"auto_merge": True, "sha": "abc123"})],
+        )
+
+    def test_human_note_in_advisory_thread_still_blocks(self):
+        mr = base_mr(detailed_merge_status="discussions_not_resolved")
+        client = FakeClient(
+            mr,
+            discussions=[
+                {
+                    "notes": [
+                        {
+                            "resolvable": True,
+                            "resolved": False,
+                            "author": {"username": "ai-reviewer"},
+                        },
+                        {
+                            "resolvable": True,
+                            "resolved": False,
+                            "author": {"username": "human-reviewer"},
+                        },
+                    ]
+                },
+            ],
+        )
+        state = guardian.StateStore(Path("/tmp/unused-guardian-state.json"))
+
+        rows, events = guardian.run_cycle(
+            client, config(advisory_reviewers=["ai-reviewer"]), state, mutate=True
+        )
+
+        self.assertEqual(rows[0]["phase"], "paused_for_review")
+        self.assertEqual(rows[0]["advisory_unresolved"], 1)
+        self.assertEqual(client.mutations, [])
+
     def test_old_merge_request_is_out_of_scope_by_default(self):
         client = FakeClient(base_mr(updated_at="2020-01-01T00:00:00+00:00"))
         state = guardian.StateStore(Path("/tmp/unused-guardian-state.json"))
@@ -193,21 +314,108 @@ class GuardianCycleTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_project_filter_is_optional_and_not_in_native_user_config(self):
+    def test_manifest_does_not_declare_native_user_config(self):
         manifest_path = SCRIPT.parents[1] / ".claude-plugin" / "plugin.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-        self.assertNotIn("include_projects", manifest["userConfig"])
-        self.assertNotIn("monitor_enabled", manifest["userConfig"])
+        self.assertNotIn("userConfig", manifest)
         self.assertEqual(guardian.validate_config({})["include_projects"], [])
 
-    def test_monitor_command_passes_hostname_and_plugin_data_explicitly(self):
+    def test_monitor_command_uses_plugin_data_dir_without_user_config(self):
         monitor_path = SCRIPT.parents[1] / "monitors" / "monitors.json"
         monitor = json.loads(monitor_path.read_text(encoding="utf-8"))[0]
 
-        self.assertIn("${user_config.hostname}", monitor["command"])
+        self.assertNotIn("${user_config.", monitor["command"])
+        self.assertIn("--plugin-data-dir", monitor["command"])
         self.assertIn("${CLAUDE_PLUGIN_DATA}", monitor["command"])
-        self.assertIn("--runtime-hostname", monitor["command"])
+
+    def test_skills_do_not_reference_user_config(self):
+        skills_root = SCRIPT.parents[1] / "skills"
+        for skill in sorted(skills_root.glob("*/SKILL.md")):
+            self.assertNotIn(
+                "${user_config.",
+                skill.read_text(encoding="utf-8"),
+                msg=f"{skill} still references ${{user_config.*}}",
+            )
+
+    def test_configure_persists_settings_read_by_all_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            configure_args = guardian.build_parser().parse_args(
+                [
+                    "--plugin-data-dir",
+                    temporary,
+                    "configure",
+                    "--hostname",
+                    "gitlab.example.com",
+                    "--auto-rebase",
+                    "true",
+                    "--poll-interval-seconds",
+                    "1800",
+                ]
+            )
+            with patch.object(guardian, "emit"), patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(guardian.command_configure(configure_args), 0)
+
+                settings_file = (Path(temporary) / "settings.json").resolve()
+                self.assertTrue(settings_file.is_file())
+                saved = json.loads(settings_file.read_text(encoding="utf-8"))
+                self.assertEqual(saved["hostname"], "gitlab.example.com")
+                self.assertTrue(saved["auto_rebase"])
+
+                monitor_args = guardian.build_parser().parse_args(
+                    ["--plugin-data-dir", temporary, "status"]
+                )
+                loaded, path, source = guardian.load_runtime_config(monitor_args)
+
+        self.assertEqual(source, "plugin-settings-file")
+        self.assertEqual(path, settings_file)
+        self.assertEqual(loaded["hostname"], "gitlab.example.com")
+        self.assertTrue(loaded["auto_rebase"])
+        self.assertEqual(loaded["poll_interval_seconds"], 1800)
+        self.assertFalse(loaded["auto_merge"])
+
+    def test_configure_merges_with_existing_settings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(guardian, "emit"), patch.dict(os.environ, {}, clear=True):
+                first = guardian.build_parser().parse_args(
+                    [
+                        "--plugin-data-dir",
+                        temporary,
+                        "configure",
+                        "--hostname",
+                        "gitlab.example.com",
+                    ]
+                )
+                guardian.command_configure(first)
+                second = guardian.build_parser().parse_args(
+                    ["--plugin-data-dir", temporary, "configure", "--auto-merge", "true"]
+                )
+                guardian.command_configure(second)
+
+                saved = json.loads(
+                    (Path(temporary) / "settings.json").read_text(encoding="utf-8")
+                )
+
+        self.assertEqual(saved["hostname"], "gitlab.example.com")
+        self.assertTrue(saved["auto_merge"])
+
+    def test_settings_file_overrides_plugin_environment_options(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_file = Path(temporary) / "settings.json"
+            settings_file.write_text(
+                '{"hostname": "settings.example.com"}\n', encoding="utf-8"
+            )
+            environment = {
+                "CLAUDE_PLUGIN_DATA": temporary,
+                "CLAUDE_PLUGIN_OPTION_hostname": "env.example.com",
+                "CLAUDE_PLUGIN_OPTION_auto_rebase": "true",
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                loaded, path, source = guardian.load_config()
+
+        self.assertEqual(source, "plugin-settings-file")
+        self.assertEqual(loaded["hostname"], "settings.example.com")
+        self.assertTrue(loaded["auto_rebase"])
 
     def test_monitor_control_defaults_to_stopped_and_persists(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -311,6 +519,7 @@ class ConfigurationTests(unittest.TestCase):
             )
             environment = {
                 "XDG_CONFIG_HOME": temporary,
+                "XDG_CACHE_HOME": temporary,
                 "CLAUDE_PLUGIN_OPTION_hostname": "plugin.example.com",
                 "CLAUDE_PLUGIN_OPTION_auto_rebase": "true",
             }

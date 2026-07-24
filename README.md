@@ -34,21 +34,18 @@
 ```bash
 claude plugin marketplace add MisterRaindrop/gitlab-mr-guardian
 claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
-  --scope user \
-  --config hostname=gitlab.example.com \
-  --config poll_interval_seconds=3600 \
-  --config auto_rebase=true \
-  --config auto_merge=true \
-  --config trigger_pipeline_when_missing_or_skipped=true \
-  --config max_mr_age_days=90 \
-  --config report_ci_failures=true
+  --scope user
 ```
 
-上面的参数允许插件执行 rebase 和请求 auto-merge，请先确认这符合团队规则。安装完成后后台监控仍保持停止，不会因为启动 Claude 就访问 GitLab。需要自动轮询时，在 Claude Code 中显式执行 `/gitlab-mr-guardian:start`；使用 `/gitlab-mr-guardian:stop` 可以随时停止。手动 `/check` 不受监控开关影响。
+安装后在 Claude Code 中执行一次配置，把 GitLab 主机和安全选项写入插件数据目录：
 
-未通过 `--config` 提供的选项使用插件声明的安全默认值。安装后可以通过 `/plugin` 的 Installed 页面进入配置流程；在已经打开的会话中安装或修改配置后，运行 `/reload-plugins` 即可重新加载。
+```text
+/gitlab-mr-guardian:setup gitlab.example.com
+```
 
-使用 `--scope user` 时，Claude Code 会自动把选项保存在用户级设置中，而不是当前业务仓库。无需手动创建配置文件，`/gitlab-mr-guardian:setup` 也不会创建业务仓库配置文件。也可以完全通过 `/plugin` 界面添加 Marketplace、安装和管理插件。
+`setup` 会验证 `glab` 认证、把配置持久化到 `${CLAUDE_PLUGIN_DATA}/settings.json`，并执行一次只读状态检查。`auto_rebase` 和 `auto_merge` 默认关闭；启用它们意味着插件可以改写源分支并合并代码，请先确认这符合团队规则。
+
+后台监控默认停止，不会因为启动 Claude 就访问 GitLab。需要自动轮询时，显式执行 `/gitlab-mr-guardian:start`；使用 `/gitlab-mr-guardian:stop` 可以随时停止。手动 `/check` 不受监控开关影响。也可以完全通过 `/plugin` 界面添加 Marketplace、安装和管理插件。
 
 ## 推荐配置
 
@@ -66,14 +63,35 @@ claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
 
 不需要配置 `include_projects`。插件默认监控当前 `glab` 用户创建的所有项目中的 MR；高级调试场景仍可在显式 JSON 配置文件中使用该过滤器。
 
+### 可选的托管规则扩展（默认全部关闭）
+
+| 配置项 | 默认 | 作用 |
+| --- | --- | --- |
+| `retry_failed_pipeline_once` | `false` | 已审批且无阻塞讨论的 MR，CI 失败时对同一条流水线自动重试一次（只重跑失败的 Job），用于偶发的环境类失败。重试后仍失败视为真实回归，只报告、不再重试。 |
+| `rebase_when_ci_failed` | `false` | GitLab 返回 `need_rebase` 但当前 CI 失败、缺失或被跳过时，也允许执行安全 rebase（rebase 会在新基线上触发全新 CI）。需同时开启 `auto_rebase`，审批保护检查照常生效。 |
+| `advisory_reviewers` | `[]` | 这些用户名（例如 AI Review 机器人）发起的未解决讨论视为参考意见，不阻塞自动操作；数量会以 `advisory_unresolved` 字段出现在状态输出中。任何其他账号的未解决讨论（包括在 AI 线程中的人工回复）仍然阻塞。 |
+
+通过 setup 或 `configure` 子命令启用，例如：
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" \
+  --plugin-data-dir "${CLAUDE_PLUGIN_DATA}" \
+  configure \
+  --retry-failed-pipeline-once true \
+  --rebase-when-ci-failed true \
+  --advisory-reviewers ai-review-bot
+```
+
+注意：如果 GitLab 项目开启了“合并前必须解决所有讨论”，即使插件把 AI 讨论视为参考，GitLab 本身仍会拒绝合并；此时需要解决讨论或调整项目设置。
+
 即使启用了推荐配置，以下保护仍然有效：未完成审批、存在未解决 discussion、存在代码冲突、rebase 会清除审批时，插件不会自动推进。失败或取消的 CI 也只报告，不会自动重试。
 
 ### 配置是如何创建的
 
-- **Marketplace 正式安装：**无需创建 JSON。安装命令中的 `--config`，或 `/plugin` 启用时的配置界面，会由 Claude Code 自动保存到用户级插件设置。
-- **`/gitlab-mr-guardian:setup`：**检查 `glab` 认证、展示当前配置并执行只读状态检查；它不会创建或修改业务仓库中的文件。
-- **监控开关：**`start` / `stop` 状态保存在 `${CLAUDE_PLUGIN_DATA}`，默认停止并跨 Claude 会话保留，不需要修改插件安装配置。
-- **重新配置：**打开 `/plugin` → Installed → GitLab MR Guardian 的配置流程，修改后执行 `/reload-plugins`。Monitor 配置变化需要重新启动会话才能完全生效。
+- **`/gitlab-mr-guardian:setup`：**唯一的正式配置入口。它验证 `glab` 认证，把主机名和安全选项写入 `${CLAUDE_PLUGIN_DATA}/settings.json`（权限 0600），并执行只读状态检查；它不会创建或修改业务仓库中的文件。
+- **后台 Monitor 与所有命令从同一个 `settings.json` 读取配置。**从 Claude Code 2.1.207 起，Monitor 命令不再接收 `${user_config.*}` 或 `CLAUDE_PLUGIN_OPTION_*`，因此插件自己维护这个配置文件。Monitor 每个轮询周期重新读取，配置修改后无需重启会话。
+- **监控开关：**`start` / `stop` 状态保存在 `${CLAUDE_PLUGIN_DATA}/control.json`，默认停止并跨 Claude 会话保留。
+- **重新配置：**再次运行 `/gitlab-mr-guardian:setup`，或直接执行 `configure` 子命令；只传需要修改的选项，其余保持不变。
 - **`--plugin-dir` 开发模式：**通常直接使用插件默认选项和 Git remote 推断主机。只有脱离 Claude Code 单独测试脚本时，才需要后文所述的用户级开发配置文件。
 
 ## 从本地 Marketplace 安装
@@ -83,12 +101,10 @@ claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
 ```bash
 claude plugin marketplace add /absolute/path/to/gitlab-mr-guardian
 claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
-  --scope user \
-  --config hostname=gitlab.example.com \
-  --config poll_interval_seconds=3600 \
-  --config auto_rebase=true \
-  --config auto_merge=true
+  --scope user
 ```
+
+安装后同样通过 `/gitlab-mr-guardian:setup` 写入配置。
 
 这条路径必须是绝对路径，或是相对于启动 Claude Code 时所在目录的路径。
 
@@ -113,12 +129,19 @@ claude --plugin-dir ./gitlab-mr-guardian
 
 ## 配置与状态
 
-正式安装时，配置来自 `.claude-plugin/plugin.json` 中声明的 `userConfig`。Claude Code 将非敏感选项保存在用户级 `~/.claude/settings.json` 的插件配置区域，并通过环境变量传给插件进程。
+正式安装时，配置保存在 Claude Code 提供的 `${CLAUDE_PLUGIN_DATA}` 持久目录下的 `settings.json`，由 `/gitlab-mr-guardian:setup`（即 `configure` 子命令）写入，后台 Monitor 和所有手动命令都从这个文件读取。
+
+配置读取优先级：
+
+1. 显式传入的 `--config` / `MR_GUARDIAN_CONFIG`（仅用于高级调试）。
+2. `${CLAUDE_PLUGIN_DATA}/settings.json`（正式安装的配置来源）。
+3. 旧版 Claude Code（< 2.1.207）导出的 `CLAUDE_PLUGIN_OPTION_*` 环境变量（向后兼容）。
+4. 用户级开发配置文件 `~/.config/gitlab-mr-guardian/config.json`。
+5. 内置安全默认值。
 
 - 插件源码中的 `config.example.json` 只是高级选项参考，不是运行时配置。
-- 轮询状态和去重信息保存在 Claude 提供的 `${CLAUDE_PLUGIN_DATA}` 持久目录。
+- 轮询状态、去重信息和监控开关也保存在 `${CLAUDE_PLUGIN_DATA}`。
 - 插件不会写入当前仓库的 `.claude/`、`.gitignore` 或其他业务文件。
-- 显式传入的 `--config` / `MR_GUARDIAN_CONFIG` 仅用于高级调试和兼容场景。
 
 ## 使用
 
@@ -130,7 +153,7 @@ claude --plugin-dir ./gitlab-mr-guardian
 /gitlab-mr-guardian:stop
 ```
 
-- `setup`：检查认证、说明当前配置并执行只读状态检查，不创建配置文件。
+- `setup`：验证认证，把主机名与安全选项写入插件数据目录的 `settings.json`，并执行只读状态检查。
 - `status`：只读查看 MR 当前状态。
 - `check`：立即执行一次已配置的受保护推进流程。
 - `start`：开始后台轮询；开关状态跨会话保存。
@@ -143,7 +166,8 @@ claude --plugin-dir ./gitlab-mr-guardian
 - `auto_rebase` 和 `auto_merge` 必须在插件配置中显式启用。
 - 默认只处理最近 90 天内有更新的 MR，避免误碰长期遗留的开放分支；设为 `0` 才会取消时间限制。
 - Rebase 仅在 GitLab 返回 `need_rebase` 时执行，不会为了“保持新鲜”而反复创建提交。
-- 只有已受监控或历史上存在成功 Pipeline 的 MR，才会在当前 Pipeline 为 `missing/skipped` 时补跑；`failed/canceled` 仍只报告。
+- 只有已受监控或历史上存在成功 Pipeline 的 MR，才会在当前 Pipeline 为 `missing/skipped` 时补跑。`failed/canceled` 默认只报告；显式开启 `retry_failed_pipeline_once` 后，同一条流水线最多自动重试一次，重试后仍失败只报告。
+- 人类评审的未解决讨论始终阻塞自动操作；只有显式列入 `advisory_reviewers` 的账号（如 AI Review 机器人）的讨论被视为参考。
 - 如果项目启用了 `reset_approvals_on_push`，默认禁止自动 rebase，因为它可能清除已有审批。
 - Auto-merge 请求携带当前 MR SHA，避免审查过的提交与被合并提交不一致。
 - 插件不会自动重试失败 CI，也不会自动解决 Review 意见或代码冲突。

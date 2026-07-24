@@ -6,7 +6,16 @@ disable-model-invocation: true
 
 # Start GitLab MR Guardian monitoring
 
-1. State that background monitoring will use `auto_rebase=${user_config.auto_rebase}` and `auto_merge=${user_config.auto_merge}`.
+1. Show the effective configuration:
+
+   ```bash
+   "${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" \
+     --plugin-data-dir "${CLAUDE_PLUGIN_DATA}" \
+     configure
+   ```
+
+   State the `auto_rebase` and `auto_merge` values that background polling will use. If `hostname` is empty and cannot be inferred from the current repository remote, direct the user to run `/gitlab-mr-guardian:setup <hostname>` first instead of starting.
+
 2. Run:
 
    ```bash

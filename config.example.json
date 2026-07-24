@@ -13,5 +13,8 @@
   "max_mr_age_days": 90,
   "max_open_merge_requests": 50,
   "rebase_cooldown_seconds": 900,
-  "report_ci_failures": true
+  "report_ci_failures": true,
+  "retry_failed_pipeline_once": false,
+  "rebase_when_ci_failed": false,
+  "advisory_reviewers": []
 }

@@ -41,6 +41,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_open_merge_requests": 50,
     "rebase_cooldown_seconds": 900,
     "report_ci_failures": True,
+    "retry_failed_pipeline_once": False,
+    "rebase_when_ci_failed": False,
+    "advisory_reviewers": [],
 }
 
 PLUGIN_OPTION_FIELDS = (
@@ -52,6 +55,21 @@ PLUGIN_OPTION_FIELDS = (
     "include_projects",
     "max_mr_age_days",
     "report_ci_failures",
+)
+
+SETTINGS_SUMMARY_FIELDS = (
+    "hostname",
+    "poll_interval_seconds",
+    "auto_rebase",
+    "auto_merge",
+    "trigger_pipeline_when_missing_or_skipped",
+    "max_mr_age_days",
+    "report_ci_failures",
+    "retry_failed_pipeline_once",
+    "rebase_when_ci_failed",
+    "advisory_reviewers",
+    "include_projects",
+    "exclude_projects",
 )
 
 RUNNING_PIPELINE_STATES = {
@@ -139,6 +157,48 @@ def find_config_path(explicit: Optional[str] = None) -> Optional[Path]:
     return None
 
 
+def plugin_data_root_from(plugin_data_dir: Optional[str] = None) -> Path:
+    explicit = plugin_data_dir or os.environ.get("CLAUDE_PLUGIN_DATA")
+    if explicit:
+        return Path(str(explicit)).expanduser().resolve()
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache_root / PROGRAM
+
+
+def settings_file_path(plugin_data_dir: Optional[str] = None) -> Path:
+    return plugin_data_root_from(plugin_data_dir) / "settings.json"
+
+
+def load_settings_file(
+    plugin_data_dir: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Optional[Path]]:
+    path = settings_file_path(plugin_data_dir)
+    if not path.is_file():
+        return {}, None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GuardianError(f"无法读取插件配置 {path}：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise GuardianError(f"插件配置 {path} 的顶层必须是 JSON 对象")
+    return payload, path
+
+
+def write_settings_file(
+    settings: Dict[str, Any], plugin_data_dir: Optional[str] = None
+) -> Path:
+    path = settings_file_path(plugin_data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+    return path
+
+
 def plugin_option(name: str) -> Optional[str]:
     prefix = "CLAUDE_PLUGIN_OPTION_"
     for key in (f"{prefix}{name}", f"{prefix}{name.upper()}"):
@@ -199,6 +259,8 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "allow_rebase_that_resets_approvals",
         "allow_rebase_when_approval_policy_unknown",
         "report_ci_failures",
+        "retry_failed_pipeline_once",
+        "rebase_when_ci_failed",
     )
     for field in bool_fields:
         if not isinstance(result[field], bool):
@@ -215,7 +277,7 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(result["max_mr_age_days"], int) or result["max_mr_age_days"] < 0:
         raise GuardianError("配置项 max_mr_age_days 必须是不小于 0 的整数")
 
-    for field in ("include_projects", "exclude_projects"):
+    for field in ("include_projects", "exclude_projects", "advisory_reviewers"):
         if not isinstance(result[field], list) or not all(
             isinstance(value, (str, int)) for value in result[field]
         ):
@@ -229,11 +291,17 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_config(
     explicit: Optional[str] = None,
+    plugin_data_dir: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Optional[Path], str]:
-    plugin_config = plugin_options_config()
     explicit_candidate = explicit or os.environ.get("MR_GUARDIAN_CONFIG")
-    if plugin_config and not explicit_candidate:
-        return validate_config(plugin_config), None, "plugin-user-config"
+    if not explicit_candidate:
+        settings, settings_path = load_settings_file(plugin_data_dir)
+        plugin_config = plugin_options_config()
+        if settings:
+            merged = {**plugin_config, **settings}
+            return validate_config(merged), settings_path, "plugin-settings-file"
+        if plugin_config:
+            return validate_config(plugin_config), None, "plugin-user-config"
 
     path = find_config_path(explicit)
     if path is None:
@@ -250,7 +318,8 @@ def load_config(
 def load_runtime_config(
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, Any], Optional[Path], str]:
-    config, path, source = load_config(args.config)
+    plugin_data_dir = getattr(args, "plugin_data_dir", None)
+    config, path, source = load_config(args.config, plugin_data_dir)
     overrides: Dict[str, Any] = {}
 
     hostname = getattr(args, "runtime_hostname", None)
@@ -278,7 +347,6 @@ def load_runtime_config(
         if value is not None:
             overrides[field] = parse_bool_option(field, value)
 
-    plugin_data_dir = getattr(args, "plugin_data_dir", None)
     if plugin_data_dir:
         overrides["plugin_data_dir"] = plugin_data_dir
 
@@ -286,11 +354,7 @@ def load_runtime_config(
 
 
 def plugin_data_root(config: Dict[str, Any]) -> Path:
-    explicit = config.get("plugin_data_dir") or os.environ.get("CLAUDE_PLUGIN_DATA")
-    if explicit:
-        return Path(str(explicit)).expanduser().resolve()
-    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    return cache_root / PROGRAM
+    return plugin_data_root_from(config.get("plugin_data_dir"))
 
 
 def control_path(config: Dict[str, Any]) -> Path:
@@ -528,15 +592,34 @@ def approval_satisfied(payload: Dict[str, Any], require_one: bool) -> bool:
     return not require_one or bool(approved_by)
 
 
-def has_unresolved_discussion(client: GlabClient, project_id: Any, iid: Any) -> bool:
+def unresolved_discussions(
+    client: GlabClient,
+    project_id: Any,
+    iid: Any,
+    advisory_reviewers: List[Any],
+) -> Tuple[int, int]:
+    """Count unresolved notes as (blocking, advisory).
+
+    Notes authored by an advisory reviewer (for example an AI review bot) are
+    reference-only and never block automation; any unresolved note from another
+    author blocks, even inside a thread an advisory reviewer started.
+    """
+    advisory_authors = {str(name).lower() for name in advisory_reviewers}
+    blocking = 0
+    advisory = 0
     discussions = client.paginated(
         f"projects/{project_id}/merge_requests/{iid}/discussions"
     )
     for discussion in discussions:
         for note in discussion.get("notes") or []:
-            if note.get("resolvable") and not note.get("resolved", False):
-                return True
-    return False
+            if not note.get("resolvable") or note.get("resolved", False):
+                continue
+            author = str((note.get("author") or {}).get("username") or "").lower()
+            if author and author in advisory_authors:
+                advisory += 1
+            else:
+                blocking += 1
+    return blocking, advisory
 
 
 def list_mr_pipelines(client: GlabClient, mr: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -603,6 +686,62 @@ def event_for_mr(
         "message": message,
         **extra,
     }
+
+
+def attempt_safe_rebase(
+    client: GlabClient,
+    config: Dict[str, Any],
+    state: StateStore,
+    mr: Dict[str, Any],
+    policy_cache: Dict[str, Optional[bool]],
+    events: List[Dict[str, Any]],
+) -> str:
+    """Request a rebase when the approval-reset policy allows it.
+
+    Returns the resulting phase: "rebase_requested" on success, otherwise
+    "needs_rebase" (blocked by policy or still inside the cooldown window).
+    """
+    project_id, iid = mr.get("project_id"), mr.get("iid")
+    key = mr_key(mr)
+    resets = approval_reset_policy(client, project_id, policy_cache)
+    safe_policy = (
+        resets is False
+        or (resets is True and config["allow_rebase_that_resets_approvals"])
+        or (resets is None and config["allow_rebase_when_approval_policy_unknown"])
+    )
+    if not safe_policy:
+        policy_name = "unknown" if resets is None else "resets-approvals"
+        signature = f"{policy_name}:{mr.get('sha')}"
+        if state.should_emit(f"rebase-policy:{key}", signature):
+            events.append(
+                event_for_mr(
+                    "REBASE_BLOCKED_BY_APPROVAL_POLICY",
+                    mr,
+                    "自动 rebase 已阻止，因为可能清除现有审批。",
+                    approval_policy=policy_name,
+                )
+            )
+        return "needs_rebase"
+
+    action_key = f"rebase:{key}"
+    action_signature = str(mr.get("sha"))
+    if not state.action_allowed(
+        action_key, action_signature, config["rebase_cooldown_seconds"]
+    ):
+        return "needs_rebase"
+    client.api(
+        f"projects/{project_id}/merge_requests/{iid}/rebase",
+        method="PUT",
+    )
+    state.record_action(action_key, action_signature)
+    events.append(
+        event_for_mr(
+            "REBASE_REQUESTED",
+            mr,
+            "已请求安全 rebase；GitLab 将为新提交触发 CI。",
+        )
+    )
+    return "rebase_requested"
 
 
 def run_cycle(
@@ -714,9 +853,14 @@ def run_cycle(
                 state.data["mrs"][key] = {**row, "sha": mr.get("sha")}
                 continue
 
-            unresolved = status in REVIEW_BLOCKING_STATUSES or has_unresolved_discussion(
-                client, project_id, iid
+            blocking_notes, advisory_notes = unresolved_discussions(
+                client, project_id, iid, config["advisory_reviewers"]
             )
+            status_blocks_review = status in REVIEW_BLOCKING_STATUSES
+            if status == "discussions_not_resolved" and blocking_notes == 0:
+                # Every unresolved thread is advisory (AI review) — reference only.
+                status_blocks_review = False
+            unresolved = status_blocks_review or blocking_notes > 0
             if unresolved:
                 row = {
                     "mr": key,
@@ -728,6 +872,7 @@ def run_cycle(
                     "approved": True,
                     "pipeline": pipeline,
                     "merge_status": status,
+                    "advisory_unresolved": advisory_notes,
                 }
                 rows.append(row)
                 state.data["mrs"][key] = {**row, "sha": mr.get("sha")}
@@ -756,6 +901,46 @@ def run_cycle(
                 phase = "waiting_for_successful_ci"
                 if pipeline["status"] in RUNNING_PIPELINE_STATES:
                     phase = "ci_running"
+                elif mr.get("rebase_in_progress"):
+                    phase = "rebasing"
+                elif status == "need_rebase" and config["rebase_when_ci_failed"]:
+                    phase = "needs_rebase"
+                    if mutate and config["auto_rebase"]:
+                        phase = attempt_safe_rebase(
+                            client, config, state, mr, policy_cache, events
+                        )
+                        if phase == "rebase_requested":
+                            managed = True
+                elif (
+                    pipeline["status"] in FAILED_PIPELINE_STATES
+                    and config["retry_failed_pipeline_once"]
+                    and pipeline["id"] is not None
+                ):
+                    retry_key = f"retry:{key}"
+                    previous_retry = state.data["actions"].get(retry_key)
+                    already_retried = (
+                        isinstance(previous_retry, dict)
+                        and previous_retry.get("signature") == str(pipeline["id"])
+                    )
+                    if mutate and not already_retried:
+                        client.api(
+                            f"projects/{project_id}/pipelines/{pipeline['id']}/retry",
+                            method="POST",
+                        )
+                        state.record_action(retry_key, str(pipeline["id"]))
+                        # Let a post-retry failure of the same pipeline report again.
+                        state.data["events"].pop(f"ci-failed:{key}", None)
+                        phase = "pipeline_retry_requested"
+                        managed = True
+                        events.append(
+                            event_for_mr(
+                                "PIPELINE_RETRY_REQUESTED",
+                                mr,
+                                "已审批 MR 的 CI 失败，已自动重试一次失败的 Job；"
+                                "同一条流水线重试后仍失败将只报告，不再重试。",
+                                pipeline=pipeline,
+                            )
+                        )
                 elif pipeline["status"] in {"missing", "skipped"} and managed:
                     phase = "pipeline_refresh_needed"
                     if mutate and config["trigger_pipeline_when_missing_or_skipped"]:
@@ -797,6 +982,7 @@ def run_cycle(
                     "approved": True,
                     "pipeline": pipeline,
                     "merge_status": status,
+                    "advisory_unresolved": advisory_notes,
                 }
                 rows.append(row)
                 state.data["mrs"][key] = {**row, "sha": mr.get("sha")}
@@ -821,48 +1007,9 @@ def run_cycle(
             elif status == "need_rebase":
                 phase = "needs_rebase"
                 if mutate and config["auto_rebase"]:
-                    resets = approval_reset_policy(client, project_id, policy_cache)
-                    safe_policy = (
-                        resets is False
-                        or (resets is True and config["allow_rebase_that_resets_approvals"])
-                        or (
-                            resets is None
-                            and config["allow_rebase_when_approval_policy_unknown"]
-                        )
+                    phase = attempt_safe_rebase(
+                        client, config, state, mr, policy_cache, events
                     )
-                    if not safe_policy:
-                        policy_name = "unknown" if resets is None else "resets-approvals"
-                        signature = f"{policy_name}:{mr.get('sha')}"
-                        if state.should_emit(f"rebase-policy:{key}", signature):
-                            events.append(
-                                event_for_mr(
-                                    "REBASE_BLOCKED_BY_APPROVAL_POLICY",
-                                    mr,
-                                    "自动 rebase 已阻止，因为可能清除现有审批。",
-                                    approval_policy=policy_name,
-                                )
-                            )
-                    else:
-                        action_key = f"rebase:{key}"
-                        action_signature = str(mr.get("sha"))
-                        if state.action_allowed(
-                            action_key,
-                            action_signature,
-                            config["rebase_cooldown_seconds"],
-                        ):
-                            client.api(
-                                f"projects/{project_id}/merge_requests/{iid}/rebase",
-                                method="PUT",
-                            )
-                            state.record_action(action_key, action_signature)
-                            phase = "rebase_requested"
-                            events.append(
-                                event_for_mr(
-                                    "REBASE_REQUESTED",
-                                    mr,
-                                    "已请求安全 rebase；GitLab 将为新提交触发 CI。",
-                                )
-                            )
             elif mutate and config["auto_merge"]:
                 already_enabled = bool(
                     mr.get("auto_merge_enabled")
@@ -903,6 +1050,7 @@ def run_cycle(
                 "approved": True,
                 "pipeline": pipeline,
                 "merge_status": status,
+                "advisory_unresolved": advisory_notes,
             }
             rows.append(row)
             state.data["mrs"][key] = {**row, "sha": mr.get("sha")}
@@ -948,6 +1096,75 @@ def command_init(args: argparse.Namespace) -> int:
             "auto_rebase": args.auto_rebase,
             "auto_merge": args.auto_merge,
             "message": "用户配置已创建。后台 Monitor 会在 Claude Code 会话期间轮询。",
+        }
+    )
+    return 0
+
+
+def collect_configure_updates(args: argparse.Namespace) -> Dict[str, Any]:
+    updates: Dict[str, Any] = {}
+    hostname = getattr(args, "hostname", None)
+    if hostname is not None:
+        updates["hostname"] = hostname.strip() or None
+
+    for attribute in ("poll_interval_seconds", "max_mr_age_days"):
+        value = getattr(args, attribute, None)
+        if value is not None:
+            updates[attribute] = value
+
+    for attribute in (
+        "auto_rebase",
+        "auto_merge",
+        "trigger_pipeline_when_missing_or_skipped",
+        "report_ci_failures",
+        "retry_failed_pipeline_once",
+        "rebase_when_ci_failed",
+    ):
+        value = getattr(args, attribute, None)
+        if value is not None:
+            updates[attribute] = parse_bool_option(attribute, value)
+
+    for attribute in ("include_projects", "exclude_projects", "advisory_reviewers"):
+        value = getattr(args, attribute, None)
+        if value is not None:
+            updates[attribute] = [item.strip() for item in value.split(",") if item.strip()]
+    return updates
+
+
+def command_configure(args: argparse.Namespace) -> int:
+    plugin_data_dir = getattr(args, "plugin_data_dir", None)
+    updates = collect_configure_updates(args)
+
+    if not updates:
+        config, path, source = load_runtime_config(args)
+        emit(
+            {
+                "event": "CONFIG_SHOW",
+                "config_source": source,
+                "path": str(path) if path else None,
+                "monitor_enabled": monitor_control_enabled(config),
+                "config": {field: config[field] for field in SETTINGS_SUMMARY_FIELDS},
+                "message": "当前生效配置。未提供任何选项时 configure 只展示配置，不写入文件。",
+            }
+        )
+        return 0
+
+    existing, _existing_path = load_settings_file(plugin_data_dir)
+    merged = {**existing, **updates}
+    effective = validate_config(merged)
+    target = write_settings_file(merged, plugin_data_dir)
+    emit(
+        {
+            "event": "CONFIG_SAVED",
+            "path": str(target),
+            "monitor_enabled": monitor_control_enabled(
+                {"plugin_data_dir": plugin_data_dir}
+            ),
+            "config": {field: effective[field] for field in SETTINGS_SUMMARY_FIELDS},
+            "message": (
+                "配置已保存到插件数据目录；后台 Monitor 从该文件读取配置，"
+                "会在下一个轮询周期使用新值。"
+            ),
         }
     )
     return 0
@@ -1140,6 +1357,59 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--auto-merge", action="store_true")
     init_parser.add_argument("--force", action="store_true")
 
+    configure_parser = subparsers.add_parser(
+        "configure",
+        help=(
+            "Persist plugin settings into the plugin data directory "
+            "(settings.json). Without options, show the effective configuration."
+        ),
+    )
+    configure_parser.add_argument(
+        "--hostname",
+        help="GitLab hostname; pass an empty string to clear it.",
+    )
+    configure_parser.add_argument("--poll-interval-seconds", type=int)
+    configure_parser.add_argument("--auto-rebase", choices=("true", "false"))
+    configure_parser.add_argument("--auto-merge", choices=("true", "false"))
+    configure_parser.add_argument(
+        "--trigger-pipeline-when-missing-or-skipped",
+        choices=("true", "false"),
+    )
+    configure_parser.add_argument("--max-mr-age-days", type=int)
+    configure_parser.add_argument("--report-ci-failures", choices=("true", "false"))
+    configure_parser.add_argument(
+        "--retry-failed-pipeline-once",
+        choices=("true", "false"),
+        help=(
+            "Retry the failed jobs of an approved MR's pipeline once per pipeline; "
+            "a second failure is only reported."
+        ),
+    )
+    configure_parser.add_argument(
+        "--rebase-when-ci-failed",
+        choices=("true", "false"),
+        help=(
+            "Allow the safe rebase flow for need_rebase MRs even while the current "
+            "pipeline is failed, missing, or skipped (requires auto_rebase)."
+        ),
+    )
+    configure_parser.add_argument(
+        "--advisory-reviewers",
+        help=(
+            "Comma-separated usernames (e.g. AI review bots) whose unresolved "
+            "discussions are advisory and do not block automation; "
+            "empty string clears the list."
+        ),
+    )
+    configure_parser.add_argument(
+        "--include-projects",
+        help="Comma-separated project paths or IDs; empty string clears the filter.",
+    )
+    configure_parser.add_argument(
+        "--exclude-projects",
+        help="Comma-separated project paths or IDs; empty string clears the filter.",
+    )
+
     subparsers.add_parser("status", help="Read-only status check.")
     subparsers.add_parser("check", help="Run one configured action cycle.")
     subparsers.add_parser("start", help="Enable background monitoring.")
@@ -1154,6 +1424,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     try:
         if args.command == "init":
             return command_init(args)
+        if args.command == "configure":
+            return command_configure(args)
         if args.command == "status":
             return command_status_or_check(args, mutate=False)
         if args.command == "check":
