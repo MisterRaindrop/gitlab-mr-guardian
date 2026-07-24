@@ -412,6 +412,83 @@ class GuardianCycleTests(unittest.TestCase):
         self.assertEqual(client.mutations, [])
         self.assertEqual([event["event"] for event in events], ["CI_FAILED"])
 
+    def test_skipped_pipeline_after_previous_run_is_refreshed_before_approval(self):
+        mr = base_mr(
+            head_pipeline={
+                "id": 57,
+                "status": "skipped",
+                "web_url": "https://gitlab.example.com/team/project/-/pipelines/57",
+            }
+        )
+        not_approved = {"approved": False, "approved_by": []}
+
+        # CI ran before (failed counts as a real run) → re-trigger.
+        client = FakeClient(
+            mr,
+            approvals=not_approved,
+            pipeline_history=[
+                {"id": 57, "status": "skipped", "sha": "abc123"},
+                {"id": 55, "status": "failed", "sha": "older-sha"},
+            ],
+        )
+        rows, events = guardian.run_cycle(
+            client,
+            config(),
+            guardian.StateStore(Path("/tmp/unused-guardian-state.json")),
+            mutate=True,
+        )
+
+        self.assertEqual(rows[0]["phase"], "waiting_approval")
+        self.assertEqual(client.mutations, [("pipeline", None)])
+        self.assertEqual(events[0]["event"], "PIPELINE_REQUESTED")
+
+        # CI never actually ran for this MR → leave it alone.
+        client = FakeClient(
+            mr,
+            approvals=not_approved,
+            pipeline_history=[{"id": 57, "status": "skipped", "sha": "abc123"}],
+        )
+        rows, events = guardian.run_cycle(
+            client,
+            config(),
+            guardian.StateStore(Path("/tmp/unused-2.json")),
+            mutate=True,
+        )
+
+        self.assertEqual(rows[0]["phase"], "waiting_approval")
+        self.assertEqual(client.mutations, [])
+        self.assertEqual(events, [])
+
+    def test_skipped_pipeline_is_refreshed_while_paused_for_review(self):
+        mr = base_mr(
+            detailed_merge_status="discussions_not_resolved",
+            head_pipeline={
+                "id": 57,
+                "status": "skipped",
+                "web_url": "https://gitlab.example.com/team/project/-/pipelines/57",
+            },
+        )
+        client = FakeClient(
+            mr,
+            discussions=[
+                {"notes": [{"resolvable": True, "resolved": False}]},
+            ],
+            pipeline_history=[
+                {"id": 57, "status": "skipped", "sha": "abc123"},
+                {"id": 55, "status": "success", "sha": "older-sha"},
+            ],
+        )
+        rows, events = guardian.run_cycle(
+            client,
+            config(),
+            guardian.StateStore(Path("/tmp/unused-guardian-state.json")),
+            mutate=True,
+        )
+
+        self.assertEqual(rows[0]["phase"], "paused_for_review")
+        self.assertEqual(client.mutations, [("pipeline", None)])
+        self.assertEqual(events[0]["event"], "PIPELINE_REQUESTED")
+
     def test_old_merge_request_is_out_of_scope_by_default(self):
         client = FakeClient(base_mr(updated_at="2020-01-01T00:00:00+00:00"))
         state = guardian.StateStore(Path("/tmp/unused-guardian-state.json"))

@@ -73,7 +73,7 @@ claude plugin update gitlab-mr-guardian@gitlab-mr-guardian-marketplace
 | `poll_interval_seconds` | `3600` | 每小时检查一次。允许范围为 60～86400 秒。 |
 | `auto_rebase` | `true`（默认值） | GitLab 返回 `need_rebase` 且审批安全检查通过时自动请求 rebase。 |
 | `auto_merge` | `true` | 审批和 CI 均满足条件时请求 auto-merge。 |
-| `trigger_pipeline_when_missing_or_skipped` | `true` | 已纳入监控的 MR 没有 Pipeline 或 Pipeline 被跳过时补跑。 |
+| `trigger_pipeline_when_missing_or_skipped` | `true` | 已纳入监控的 MR 没有 Pipeline 或 Pipeline 被跳过时补跑。此外，任何此前真实运行过 CI 的 MR（无论是否已审批），当前流水线被跳过时（常见于 rebase 之后）也会重新触发。 |
 | `max_mr_age_days` | `90` | 只处理最近 90 天更新过的 MR，避免误碰长期遗留分支。 |
 | `report_ci_failures` | `true` | CI 失败时通知当前 Claude 会话，但不自动重试失败 CI。 |
 
@@ -184,7 +184,7 @@ claude --plugin-dir ./gitlab-mr-guardian
 - `auto_merge` 必须在插件配置中显式启用。`auto_rebase` 默认开启，但只在 GitLab 报告 `need_rebase`、审批不会被清除且 MR 已托管时执行；不需要时用 `configure --auto-rebase false` 关闭。
 - 默认只处理最近 90 天内有更新的 MR，避免误碰长期遗留的开放分支；设为 `0` 才会取消时间限制。
 - Rebase 仅在 GitLab 返回 `need_rebase` 时执行，不会为了“保持新鲜”而反复创建提交。
-- 默认只有已受监控或历史上存在成功 Pipeline 的 MR，才会在当前 Pipeline 为 `missing/skipped` 时补跑；开启 `manage_all_approved` 后，所有已审批且无阻塞讨论的 MR 都纳入托管。`failed/canceled` 默认只报告；显式开启 `retry_failed_pipeline_once` 后，同一条流水线最多自动重试一次，重试后仍失败只报告。
+- 默认只有已受监控或历史上存在成功 Pipeline 的 MR，才会在当前 Pipeline 为 `missing/skipped` 时补跑；开启 `manage_all_approved` 后，所有已审批且无阻塞讨论的 MR 都纳入托管。例外：历史上真实运行过 CI 的 MR，当前流水线被跳过时会重新触发一条流水线（仅触发 CI，不做 rebase 或合并；从未跑过 CI 的 MR 不受影响）。`failed/canceled` 默认只报告；显式开启 `retry_failed_pipeline_once` 后，同一条流水线最多自动重试一次，重试后仍失败只报告。
 - 人类评审的未解决讨论始终阻塞自动操作；只有显式列入 `advisory_reviewers` 的账号（如 AI Review 机器人）的讨论被视为参考。
 - 如果项目启用了 `reset_approvals_on_push`，默认禁止自动 rebase，因为它可能清除已有审批。
 - Auto-merge 请求携带当前 MR SHA，避免审查过的提交与被合并提交不一致。

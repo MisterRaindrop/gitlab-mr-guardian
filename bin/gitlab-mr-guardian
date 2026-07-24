@@ -83,6 +83,8 @@ RUNNING_PIPELINE_STATES = {
     "scheduled",
 }
 FAILED_PIPELINE_STATES = {"failed", "canceled"}
+# Statuses proving CI actually ran for this MR (skipped/manual/created do not).
+PIPELINE_RAN_STATES = {"success"} | FAILED_PIPELINE_STATES | RUNNING_PIPELINE_STATES
 REVIEW_BLOCKING_STATUSES = {
     "not_approved",
     "requested_changes",
@@ -691,6 +693,56 @@ def event_for_mr(
     }
 
 
+def refresh_skipped_pipeline_after_run(
+    client: GlabClient,
+    config: Dict[str, Any],
+    state: StateStore,
+    mr: Dict[str, Any],
+    pipeline: Dict[str, Any],
+    events: List[Dict[str, Any]],
+) -> bool:
+    """Re-create CI when the current pipeline is skipped but CI ran before.
+
+    Covers the post-rebase case where GitLab creates the new pipeline as
+    skipped: the pipeline history proves this MR does run CI, so a fresh MR
+    pipeline is requested. Returns True when one was requested.
+    """
+    if pipeline["status"] != "skipped":
+        return False
+    if not config["trigger_pipeline_when_missing_or_skipped"]:
+        return False
+    key = mr_key(mr)
+    action_key = f"pipeline:{key}"
+    action_signature = f"{mr.get('sha')}:{pipeline['status']}"
+    if not state.action_allowed(
+        action_key, action_signature, config["rebase_cooldown_seconds"]
+    ):
+        return False
+    history = list_mr_pipelines(client, mr)
+    if not any(item.get("status") in PIPELINE_RAN_STATES for item in history):
+        return False
+    project_id, iid = mr.get("project_id"), mr.get("iid")
+    requested = client.api(
+        f"projects/{project_id}/merge_requests/{iid}/pipelines",
+        method="POST",
+    )
+    state.record_action(action_key, action_signature)
+    requested_pipeline = requested if isinstance(requested, dict) else {}
+    events.append(
+        event_for_mr(
+            "PIPELINE_REQUESTED",
+            mr,
+            "此前运行过 CI 的 MR 当前流水线被跳过（常见于 rebase 之后）；已重新触发 MR Pipeline。",
+            pipeline={
+                "id": requested_pipeline.get("id"),
+                "status": requested_pipeline.get("status", "pending"),
+                "url": requested_pipeline.get("web_url"),
+            },
+        )
+    )
+    return True
+
+
 def attempt_safe_rebase(
     client: GlabClient,
     config: Dict[str, Any],
@@ -836,6 +888,10 @@ def run_cycle(
 
             if not approved:
                 phase = "waiting_approval"
+                if mutate:
+                    refresh_skipped_pipeline_after_run(
+                        client, config, state, mr, pipeline, events
+                    )
                 if managed_before:
                     signature = str(mr.get("sha"))
                     if state.should_emit(f"approval-lost:{key}", signature):
@@ -870,6 +926,10 @@ def run_cycle(
                 status_blocks_review = False
             unresolved = status_blocks_review or blocking_notes > 0
             if unresolved:
+                if mutate:
+                    refresh_skipped_pipeline_after_run(
+                        client, config, state, mr, pipeline, events
+                    )
                 row = {
                     "mr": key,
                     "project": project_name(mr),
@@ -986,6 +1046,11 @@ def run_cycle(
                                     },
                                 )
                             )
+                elif pipeline["status"] == "skipped" and mutate:
+                    if refresh_skipped_pipeline_after_run(
+                        client, config, state, mr, pipeline, events
+                    ):
+                        phase = "pipeline_requested"
                 row = {
                     "mr": key,
                     "project": project_name(mr),

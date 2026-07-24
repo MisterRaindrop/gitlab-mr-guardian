@@ -73,7 +73,7 @@ The following settings best match the plugin's primary goal: keep reviewed MRs m
 | `poll_interval_seconds` | `3600` | Check once per hour. The allowed range is 60 to 86400 seconds. |
 | `auto_rebase` | `true` (the default) | Request a rebase when GitLab reports `need_rebase` and all approval safety checks pass. |
 | `auto_merge` | `true` | Request auto-merge after approvals and CI satisfy all guarded conditions. |
-| `trigger_pipeline_when_missing_or_skipped` | `true` | Start a pipeline when a managed MR has no pipeline or its pipeline was skipped. |
+| `trigger_pipeline_when_missing_or_skipped` | `true` | Start a pipeline when a managed MR has no pipeline or its pipeline was skipped. Additionally, any MR whose history shows CI actually ran gets a fresh pipeline when its current one is skipped (common right after a rebase), whether or not it is approved yet. |
 | `max_mr_age_days` | `90` | Only handle MRs updated within the last 90 days, avoiding long-lived branches. |
 | `report_ci_failures` | `true` | Notify the current Claude session when CI fails without retrying failed CI automatically. |
 
@@ -184,7 +184,7 @@ Background monitoring is stopped by default. After `start`, an active Claude ses
 - `auto_merge` must be explicitly enabled in the plugin configuration. `auto_rebase` is on by default but runs only when GitLab reports `need_rebase`, approvals cannot be cleared, and the MR is managed; disable it with `configure --auto-rebase false`.
 - By default, the plugin only handles MRs updated within the last 90 days to avoid touching long-lived branches. Set the limit to `0` to disable it.
 - A rebase is requested only when GitLab reports `need_rebase`; the plugin does not repeatedly create commits merely to keep a branch fresh.
-- By default a missing or skipped pipeline is refreshed only when the MR is already managed or has a previously successful pipeline; with `manage_all_approved` enabled, every approved MR with no blocking discussions is managed. Failed or canceled pipelines are reported by default; with `retry_failed_pipeline_once` explicitly enabled, each pipeline is retried at most once, and a post-retry failure is only reported.
+- By default a missing or skipped pipeline is refreshed only when the MR is already managed or has a previously successful pipeline; with `manage_all_approved` enabled, every approved MR with no blocking discussions is managed. Exception: an MR whose history proves CI actually ran gets a fresh pipeline when its current one is skipped (CI trigger only — no rebase or merge; MRs that never ran CI are left alone). Failed or canceled pipelines are reported by default; with `retry_failed_pipeline_once` explicitly enabled, each pipeline is retried at most once, and a post-retry failure is only reported.
 - Unresolved discussions from human reviewers always block automation; only accounts explicitly listed in `advisory_reviewers` (such as AI review bots) are treated as advisory.
 - Automatic rebase is blocked by default when a project uses `reset_approvals_on_push`, because the rebase could clear existing approvals.
 - Auto-merge requests include the current MR SHA so the reviewed commit and merged commit cannot silently diverge.
