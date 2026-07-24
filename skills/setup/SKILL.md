@@ -21,7 +21,7 @@ argument-hint: [GitLab hostname]
 
 3. Run `glab auth status --hostname <hostname>`. If it reports a token problem, do not stop there: confirm with a real read call such as `glab api user --hostname <hostname>`, because `glab auth status` can report an invalid token while API access still works. Never print or request an access token when `glab` API calls succeed. Warn the user that write operations (rebase, pipeline trigger, auto-merge) may still fail if the token lacks `api` scope.
 
-4. Explain that automatic rebase changes the source branch and automatic merge can merge code immediately. Obtain confirmation before enabling either mutation unless the user already explicitly requested it in the current turn.
+4. Explain the two mutation switches: `auto_rebase` is on by default and rewrites the source branch, but only when GitLab reports `need_rebase` and the rebase cannot clear existing approvals (offer `--auto-rebase false` to users who do not want it). `auto_merge` is off by default and can merge code immediately once all guarded checks pass; obtain confirmation before enabling it unless the user already explicitly requested it in the current turn.
 
 5. Persist the configuration into the plugin data directory. Pass only the options the user chose to set; omitted options keep their previous or default values:
 
@@ -29,9 +29,7 @@ argument-hint: [GitLab hostname]
    "${CLAUDE_PLUGIN_ROOT}/bin/gitlab-mr-guardian" \
      --plugin-data-dir "${CLAUDE_PLUGIN_DATA}" \
      configure \
-     --hostname "<hostname>" \
-     --auto-rebase false \
-     --auto-merge false
+     --hostname "<hostname>"
    ```
 
    This writes `settings.json` inside `${CLAUDE_PLUGIN_DATA}`. The background monitor and all other commands read configuration from this file; native plugin userConfig substitution is not used. Never create or edit configuration inside the user's repository.

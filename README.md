@@ -27,25 +27,41 @@
 
 插件不保存 GitLab Token，所有认证都交给 `glab`。
 
-## 从 Marketplace 安装（推荐）
+## 安装与配置
 
-在终端执行：
+分两步：先在**终端**安装插件，再在 **Claude Code 会话内**完成配置。
+
+### 第 1 步：安装插件（终端执行）
 
 ```bash
 claude plugin marketplace add MisterRaindrop/gitlab-mr-guardian
-claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
-  --scope user
+claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace --scope user
 ```
 
-安装后在 Claude Code 中执行一次配置，把 GitLab 主机和安全选项写入插件数据目录：
+也可以不用终端，在 Claude Code 会话内通过 `/plugin` 界面完成添加 Marketplace、安装和管理。
+
+### 第 2 步：配置（Claude Code 会话内执行）
 
 ```text
 /gitlab-mr-guardian:setup gitlab.example.com
 ```
 
-`setup` 会验证 `glab` 认证、把配置持久化到 `${CLAUDE_PLUGIN_DATA}/settings.json`，并执行一次只读状态检查。`auto_rebase` 和 `auto_merge` 默认关闭；启用它们意味着插件可以改写源分支并合并代码，请先确认这符合团队规则。
+`setup` 会验证 `glab` 认证、把配置持久化到 `${CLAUDE_PLUGIN_DATA}/settings.json`，并执行一次只读状态检查。`auto_rebase` 默认开启（受完整护栏约束：只在 GitLab 报告 `need_rebase` 且不会清除已有审批时执行，可用 `--auto-rebase false` 关闭）；`auto_merge` 默认关闭，启用它意味着插件可以在条件满足时直接合并代码，请先确认这符合团队规则。
 
-后台监控默认停止，不会因为启动 Claude 就访问 GitLab。需要自动轮询时，显式执行 `/gitlab-mr-guardian:start`；使用 `/gitlab-mr-guardian:stop` 可以随时停止。手动 `/check` 不受监控开关影响。也可以完全通过 `/plugin` 界面添加 Marketplace、安装和管理插件。
+> **从旧版本迁移：** 0.5.x 及更早的 README 曾建议在 `claude plugin install` 时附加 `--config hostname=...` 等参数。在 Claude Code ≥ 2.1.207 上这些值不会传递给插件，运行时一律以 `setup` 写入的 `settings.json` 为准。已经带 `--config` 安装过的用户不需要重装，执行一次 `/gitlab-mr-guardian:setup` 即可。
+
+### 第 3 步：启动监控（Claude Code 会话内执行）
+
+后台监控默认停止，不会因为启动 Claude 就访问 GitLab。需要自动轮询时，显式执行 `/gitlab-mr-guardian:start`；使用 `/gitlab-mr-guardian:stop` 可以随时停止。手动 `/check` 不受监控开关影响。
+
+### 升级到新版本（终端执行）
+
+```bash
+claude plugin marketplace update gitlab-mr-guardian-marketplace
+claude plugin update gitlab-mr-guardian@gitlab-mr-guardian-marketplace
+```
+
+升级后重启 Claude Code 会话，后台 Monitor 才会以新版本运行（`/reload-plugins` 只重载 skills，不会替换正在运行的 Monitor）。配置和监控开关保存在插件数据目录，升级不会丢失；注意 Claude Code 按版本号判断更新，插件作者发布时必须递增 `version` 字段。
 
 ## 推荐配置
 
@@ -55,7 +71,7 @@ claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
 | --- | --- | --- |
 | `hostname` | 实际 GitLab 主机 | 例如 `gitlab.example.com`；无法从当前仓库 remote 推断时必须填写。 |
 | `poll_interval_seconds` | `3600` | 每小时检查一次。允许范围为 60～86400 秒。 |
-| `auto_rebase` | `true` | GitLab 返回 `need_rebase` 且审批安全检查通过时自动请求 rebase。 |
+| `auto_rebase` | `true`（默认值） | GitLab 返回 `need_rebase` 且审批安全检查通过时自动请求 rebase。 |
 | `auto_merge` | `true` | 审批和 CI 均满足条件时请求 auto-merge。 |
 | `trigger_pipeline_when_missing_or_skipped` | `true` | 已纳入监控的 MR 没有 Pipeline 或 Pipeline 被跳过时补跑。 |
 | `max_mr_age_days` | `90` | 只处理最近 90 天更新过的 MR，避免误碰长期遗留分支。 |
@@ -165,7 +181,7 @@ claude --plugin-dir ./gitlab-mr-guardian
 
 ## 安全边界
 
-- `auto_rebase` 和 `auto_merge` 必须在插件配置中显式启用。
+- `auto_merge` 必须在插件配置中显式启用。`auto_rebase` 默认开启，但只在 GitLab 报告 `need_rebase`、审批不会被清除且 MR 已托管时执行；不需要时用 `configure --auto-rebase false` 关闭。
 - 默认只处理最近 90 天内有更新的 MR，避免误碰长期遗留的开放分支；设为 `0` 才会取消时间限制。
 - Rebase 仅在 GitLab 返回 `need_rebase` 时执行，不会为了“保持新鲜”而反复创建提交。
 - 默认只有已受监控或历史上存在成功 Pipeline 的 MR，才会在当前 Pipeline 为 `missing/skipped` 时补跑；开启 `manage_all_approved` 后，所有已审批且无阻塞讨论的 MR 都纳入托管。`failed/canceled` 默认只报告；显式开启 `retry_failed_pipeline_once` 后，同一条流水线最多自动重试一次，重试后仍失败只报告。

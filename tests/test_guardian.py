@@ -550,6 +550,13 @@ class ConfigurationTests(unittest.TestCase):
 
         self.assertEqual(loaded["poll_interval_seconds"], 3600)
 
+    def test_guarded_rebase_is_on_by_default_but_merge_is_not(self):
+        loaded = guardian.validate_config({})
+
+        self.assertTrue(loaded["auto_rebase"])
+        self.assertFalse(loaded["auto_merge"])
+        self.assertFalse(loaded["allow_rebase_that_resets_approvals"])
+
     def test_native_plugin_options_are_parsed(self):
         environment = {
             "CLAUDE_PLUGIN_OPTION_hostname": "gitlab.example.com",

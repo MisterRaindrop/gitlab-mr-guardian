@@ -27,25 +27,41 @@ Once an MR enters the monitored set, the plugin can:
 
 The plugin never stores a GitLab token. Authentication is delegated entirely to `glab`.
 
-## Install from a Marketplace (recommended)
+## Installation and configuration
 
-Run the following commands in a terminal:
+Two steps: install the plugin **in a terminal**, then configure it **inside a Claude Code session**.
+
+### Step 1: install the plugin (terminal)
 
 ```bash
 claude plugin marketplace add MisterRaindrop/gitlab-mr-guardian
-claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace \
-  --scope user
+claude plugin install gitlab-mr-guardian@gitlab-mr-guardian-marketplace --scope user
 ```
 
-After installation, run the setup command once inside Claude Code to persist the GitLab host and safety options into the plugin data directory:
+Alternatively, use the `/plugin` interface inside a Claude Code session for the entire marketplace, installation, and management flow.
+
+### Step 2: configure (inside a Claude Code session)
 
 ```text
 /gitlab-mr-guardian:setup gitlab.example.com
 ```
 
-`setup` verifies `glab` authentication, persists the configuration into `${CLAUDE_PLUGIN_DATA}/settings.json`, and performs a read-only status check. `auto_rebase` and `auto_merge` default to off; enabling them allows the plugin to rewrite source branches and merge code, so confirm that both actions comply with your team's rules.
+`setup` verifies `glab` authentication, persists the configuration into `${CLAUDE_PLUGIN_DATA}/settings.json`, and performs a read-only status check. `auto_rebase` defaults to on, fully guarded: it runs only when GitLab reports `need_rebase` and the rebase cannot clear existing approvals (disable with `--auto-rebase false`). `auto_merge` defaults to off; enabling it allows the plugin to merge code as soon as all conditions are met, so confirm this complies with your team's rules.
 
-Background monitoring remains stopped after installation and starting Claude does not contact GitLab. Run `/gitlab-mr-guardian:start` explicitly in Claude Code to begin automatic polling, and `/gitlab-mr-guardian:stop` to stop it. Manual `/check` remains available regardless of the monitoring state. You can also use the `/plugin` interface for the entire marketplace, installation, and management flow.
+> **Migrating from older versions:** the 0.5.x and earlier README suggested passing `--config hostname=...` options to `claude plugin install`. On Claude Code >= 2.1.207 those values are never delivered to the plugin; the runtime configuration is always the `settings.json` written by `setup`. If you already installed with `--config`, do not reinstall — just run `/gitlab-mr-guardian:setup` once.
+
+### Step 3: start monitoring (inside a Claude Code session)
+
+Background monitoring remains stopped after installation and starting Claude does not contact GitLab. Run `/gitlab-mr-guardian:start` explicitly in Claude Code to begin automatic polling, and `/gitlab-mr-guardian:stop` to stop it. Manual `/check` remains available regardless of the monitoring state.
+
+### Upgrading to a new version (terminal)
+
+```bash
+claude plugin marketplace update gitlab-mr-guardian-marketplace
+claude plugin update gitlab-mr-guardian@gitlab-mr-guardian-marketplace
+```
+
+Restart the Claude Code session after upgrading so the background Monitor runs the new version (`/reload-plugins` only reloads skills; it does not replace a running Monitor). Configuration and the monitoring switch live in the plugin data directory and survive upgrades. Note that Claude Code detects updates by the `version` field, so plugin authors must bump it on every release.
 
 ## Recommended configuration
 
@@ -55,7 +71,7 @@ The following settings best match the plugin's primary goal: keep reviewed MRs m
 | --- | --- | --- |
 | `hostname` | Your GitLab host | For example, `gitlab.example.com`. Required when the host cannot be inferred from the current repository remote. |
 | `poll_interval_seconds` | `3600` | Check once per hour. The allowed range is 60 to 86400 seconds. |
-| `auto_rebase` | `true` | Request a rebase when GitLab reports `need_rebase` and all approval safety checks pass. |
+| `auto_rebase` | `true` (the default) | Request a rebase when GitLab reports `need_rebase` and all approval safety checks pass. |
 | `auto_merge` | `true` | Request auto-merge after approvals and CI satisfy all guarded conditions. |
 | `trigger_pipeline_when_missing_or_skipped` | `true` | Start a pipeline when a managed MR has no pipeline or its pipeline was skipped. |
 | `max_mr_age_days` | `90` | Only handle MRs updated within the last 90 days, avoiding long-lived branches. |
@@ -165,7 +181,7 @@ Background monitoring is stopped by default. After `start`, an active Claude ses
 
 ## Safety boundaries
 
-- `auto_rebase` and `auto_merge` must be explicitly enabled in the plugin configuration.
+- `auto_merge` must be explicitly enabled in the plugin configuration. `auto_rebase` is on by default but runs only when GitLab reports `need_rebase`, approvals cannot be cleared, and the MR is managed; disable it with `configure --auto-rebase false`.
 - By default, the plugin only handles MRs updated within the last 90 days to avoid touching long-lived branches. Set the limit to `0` to disable it.
 - A rebase is requested only when GitLab reports `need_rebase`; the plugin does not repeatedly create commits merely to keep a branch fresh.
 - By default a missing or skipped pipeline is refreshed only when the MR is already managed or has a previously successful pipeline; with `manage_all_approved` enabled, every approved MR with no blocking discussions is managed. Failed or canceled pipelines are reported by default; with `retry_failed_pipeline_once` explicitly enabled, each pipeline is retried at most once, and a post-retry failure is only reported.

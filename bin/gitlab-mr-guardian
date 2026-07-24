@@ -29,7 +29,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": True,
     "hostname": None,
     "poll_interval_seconds": 3600,
-    "auto_rebase": False,
+    "auto_rebase": True,
     "auto_merge": False,
     "trigger_pipeline_when_missing_or_skipped": True,
     "require_at_least_one_approval": True,
