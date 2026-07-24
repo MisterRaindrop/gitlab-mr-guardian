@@ -190,11 +190,16 @@ Background monitoring is stopped by default. After `start`, an active Claude ses
 - Auto-merge requests include the current MR SHA so the reviewed commit and merged commit cannot silently diverge.
 - The plugin never retries failed CI automatically and never resolves review feedback or code conflicts automatically.
 
-## Session scope
+## Session scope and multi-session behavior
 
-After `start`, the Claude Code plugin Monitor belongs only to the interactive session that acquires the runtime lock. Poll results and CI alerts are delivered to that session and are not propagated, synchronized, or broadcast to other Claude Code sessions.
+**The switch persists; the process does not.** The `start` / `stop` state lives in `control.json` inside the plugin data directory, so it survives closing Claude Code and rebooting the machine, until you explicitly run `/gitlab-mr-guardian:stop`. The polling process itself only runs while an interactive Claude Code session is open: with the switch on, every newly opened session starts polling automatically without another `start`; simply closing a window pauses polling but does not turn monitoring off.
 
-If several Claude Code sessions with this plugin enabled are open at the same time, a process lock prevents duplicate actions against the same GitLab host. The session holding the lock performs monitoring and receives notifications; other sessions do not receive those notifications. If the monitoring session closes, another running session can take over on its next polling cycle.
+**With multiple sessions, a file lock decides who works.** Every open session starts its own Monitor, but they compete for the same file lock — only the session holding the lock actually polls and acts (rebase, CI trigger, auto-merge); the others stand by, preventing duplicate actions against the same GitLab host.
+
+**Close one session and another takes over.** When the lock-holding session closes, the lock is released and one of the remaining sessions acquires it on its next polling cycle. Two things to know:
+
+- **Takeover is delayed**: standby sessions retry the lock on their polling interval (1 hour by default), so in the worst case the handover takes about one polling cycle — there is a gap, not a seamless switch.
+- **Notifications follow the lock**: poll results and CI alerts appear only in the session holding the lock; after a takeover they show up in the new session.
 
 The plugin stops polling after all Claude Code sessions are closed. For true 24/7 monitoring, run the same decision logic in a persistent service, a GitLab Scheduled Pipeline, or a system scheduler, then send alerts through email, Slack, or another channel.
 
